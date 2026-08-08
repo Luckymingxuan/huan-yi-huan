@@ -19,7 +19,8 @@ type Sample = { value: number; recordedAt: number };
 type MoodLevel = { label: string; hint: string; color: string; softColor: string };
 
 const MAX_SAMPLES = 90;
-const COLLAPSED_SAMPLE_LIMIT = 22;
+const DEFAULT_COLLAPSED_SAMPLE_LIMIT = 22;
+const COLLAPSED_BAR_STEP = 12;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -78,6 +79,7 @@ function EmotionChart({
 }) {
   const chartRef = useRef<HTMLDivElement>(null);
   const isFollowingLatestRef = useRef(true);
+  const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
 
   useEffect(() => {
     if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
@@ -92,13 +94,27 @@ function EmotionChart({
     return () => cancelAnimationFrame(frame);
   }, [expanded, samples.length]);
 
+  useEffect(() => {
+    if (expanded || !chartRef.current) return;
+    const chart = chartRef.current;
+    const updateVisibleSampleLimit = () => {
+      const nextLimit = Math.max(1, Math.floor(chart.clientWidth / COLLAPSED_BAR_STEP));
+      setCollapsedSampleLimit((current) => current === nextLimit ? current : nextLimit);
+    };
+
+    updateVisibleSampleLimit();
+    const resizeObserver = new ResizeObserver(updateVisibleSampleLimit);
+    resizeObserver.observe(chart);
+    return () => resizeObserver.disconnect();
+  }, [expanded]);
+
   if (!expanded) {
-    const isOverflowing = samples.length > COLLAPSED_SAMPLE_LIMIT;
-    const recentSamples = samples.slice(-COLLAPSED_SAMPLE_LIMIT);
+    const isOverflowing = samples.length > collapsedSampleLimit;
+    const recentSamples = samples.slice(-collapsedSampleLimit);
     const streamKey = recentSamples.at(-1)?.recordedAt ?? "empty";
 
     return (
-      <div className="relative h-14 w-full overflow-hidden px-1" aria-label="最近情绪值">
+      <div ref={chartRef} className="relative h-14 w-full overflow-hidden px-1" aria-label="最近情绪值">
         <div
           key={isOverflowing ? streamKey : "growing"}
           className={cn(
@@ -547,8 +563,13 @@ export function EmotionMonitor() {
               <p className="text-xl font-medium tabular-nums">{formatDuration(elapsedSeconds)}</p>
             </div>
           ) : (
-            <div className="mt-2 flex h-16 items-center gap-6">
-              <div className="min-w-0 flex-1">
+            <div className="relative mt-2 h-16">
+              <div
+                className={cn(
+                  "absolute inset-y-0 left-3 right-26 flex -translate-y-[5px] items-center transition-[opacity,transform] duration-500 ease-out",
+                  samples.length > 0 ? "translate-x-0 opacity-100" : "-translate-x-3 opacity-0",
+                )}
+              >
                 <EmotionChart
                   samples={samples}
                   selectedIndex={null}
@@ -556,7 +577,12 @@ export function EmotionMonitor() {
                   onSelect={setSelectedIndex}
                 />
               </div>
-              <p className="shrink-0 text-2xl font-medium tabular-nums tracking-[-0.03em]">
+              <p
+                className={cn(
+                  "absolute top-[calc(50%+5px)] w-24 -translate-y-1/2 text-center text-[1.95rem] font-[650] tabular-nums tracking-[-0.03em] transition-[left,transform] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
+                  samples.length > 0 ? "left-[calc(100%-8px)] -translate-x-full" : "left-1/2 -translate-x-1/2",
+                )}
+              >
                 {formatDuration(elapsedSeconds)}
               </p>
             </div>
