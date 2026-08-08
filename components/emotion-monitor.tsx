@@ -56,6 +56,10 @@ const AUTO_FOLLOW_RESUME_DISTANCE = 4;
 const TARGET_SAMPLE_RATE = 16_000;
 const RECENT_AUDIO_SECONDS = 10;
 const REPLAY_CAPTURE_TAIL_MS = 5_000;
+const REPLAY_MIN_CAPTURE_TAIL_MS = 2_500;
+const REPLAY_QUIET_HOLD_MS = 600;
+const REPLAY_MIN_QUIET_RMS = 0.008;
+const REPLAY_MAX_QUIET_RMS = 0.025;
 const REPLAY_FEEDBACK_GUARD_MS = 250;
 const SOUNDTOUCH_PROCESSOR_URL = "/audio/formant-correction-processor.js";
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
@@ -65,6 +69,15 @@ let replayProcessorModulePromise: Promise<ReplayProcessorModule> | null = null;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function getRms(samples: Float32Array) {
+  if (samples.length === 0) return 0;
+  let sumOfSquares = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    sumOfSquares += samples[index] * samples[index];
+  }
+  return Math.sqrt(sumOfSquares / samples.length);
 }
 
 function loadReplayProcessor() {
@@ -618,6 +631,9 @@ export function EmotionMonitor() {
   const replayRequestIdRef = useRef(0);
   const replayStartTimerRef = useRef<number | null>(null);
   const replayResumeTimerRef = useRef<number | null>(null);
+  const replayPendingStartedAtRef = useRef<number | null>(null);
+  const replayQuietSinceRef = useRef<number | null>(null);
+  const replayPeakRmsRef = useRef(0);
   const isReplayingRef = useRef(false);
   const highEmotionRef = useRef(false);
   const lastReminderAtRef = useRef(0);
@@ -635,6 +651,9 @@ export function EmotionMonitor() {
       clearTimeout(replayStartTimerRef.current);
       replayStartTimerRef.current = null;
     }
+    replayPendingStartedAtRef.current = null;
+    replayQuietSinceRef.current = null;
+    replayPeakRmsRef.current = 0;
     if (replayResumeTimerRef.current !== null) {
       clearTimeout(replayResumeTimerRef.current);
       replayResumeTimerRef.current = null;
@@ -781,6 +800,18 @@ export function EmotionMonitor() {
     return true;
   }, []);
 
+  const finishPendingReplay = useCallback(() => {
+    if (replayStartTimerRef.current === null) return false;
+    clearTimeout(replayStartTimerRef.current);
+    replayStartTimerRef.current = null;
+    replayPendingStartedAtRef.current = null;
+    replayQuietSinceRef.current = null;
+    replayPeakRmsRef.current = 0;
+    setIsReplayPending(false);
+    void replayRecentAudio();
+    return true;
+  }, [replayRecentAudio]);
+
   const scheduleRecentAudioReplay = useCallback(() => {
     if (
       replayStartTimerRef.current !== null ||
@@ -796,14 +827,15 @@ export function EmotionMonitor() {
       });
       void fetch(SOUNDTOUCH_PROCESSOR_URL, { cache: "force-cache" }).catch(() => undefined);
     }
+    replayPendingStartedAtRef.current = performance.now();
+    replayQuietSinceRef.current = null;
+    replayPeakRmsRef.current = 0;
     setIsReplayPending(true);
     replayStartTimerRef.current = window.setTimeout(() => {
-      replayStartTimerRef.current = null;
-      setIsReplayPending(false);
-      void replayRecentAudio();
+      finishPendingReplay();
     }, REPLAY_CAPTURE_TAIL_MS);
     return true;
-  }, [replayRecentAudio]);
+  }, [finishPendingReplay]);
 
   const applyEmotionResult = useCallback((probs: number[]) => {
     if (isPausedRef.current || isReplayingRef.current) return;
@@ -1005,6 +1037,28 @@ export function EmotionMonitor() {
         const input = event.inputBuffer.getChannelData(0);
         if (reminderOptionRef.current === RECENT_AUDIO_REPLAY_ID) {
           appendRollingPcm(rollingAudioRef.current, input);
+        }
+        const replayPendingStartedAt = replayPendingStartedAtRef.current;
+        if (replayStartTimerRef.current !== null && replayPendingStartedAt !== null) {
+          const now = performance.now();
+          const rms = getRms(input);
+          replayPeakRmsRef.current = Math.max(replayPeakRmsRef.current, rms);
+          if (now - replayPendingStartedAt >= REPLAY_MIN_CAPTURE_TAIL_MS) {
+            const quietThreshold = clamp(
+              replayPeakRmsRef.current * 0.22,
+              REPLAY_MIN_QUIET_RMS,
+              REPLAY_MAX_QUIET_RMS,
+            );
+            if (rms <= quietThreshold) {
+              replayQuietSinceRef.current ??= now;
+              if (now - replayQuietSinceRef.current >= REPLAY_QUIET_HOLD_MS) {
+                finishPendingReplay();
+                return;
+              }
+            } else {
+              replayQuietSinceRef.current = null;
+            }
+          }
         }
         const pcm = resampleToPcm16(input, audioContext.sampleRate);
         if (
