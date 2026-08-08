@@ -31,6 +31,7 @@ type EmotionMessage = {
 };
 type RollingPcmBuffer = {
   samples: Int16Array;
+  sampleRate: number;
   writeIndex: number;
   length: number;
 };
@@ -40,7 +41,6 @@ const COLLAPSED_BAR_STEP = 12;
 const AUTO_FOLLOW_RESUME_DISTANCE = 4;
 const TARGET_SAMPLE_RATE = 16_000;
 const RECENT_AUDIO_SECONDS = 8;
-const RECENT_AUDIO_SAMPLE_CAPACITY = TARGET_SAMPLE_RATE * RECENT_AUDIO_SECONDS;
 const REPLAY_CAPTURE_TAIL_MS = 2_500;
 const REPLAY_FEEDBACK_GUARD_MS = 250;
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
@@ -91,9 +91,18 @@ function resampleToPcm16(input: Float32Array, sourceSampleRate: number) {
   return output;
 }
 
-function createRollingPcmBuffer(): RollingPcmBuffer {
+function float32ToPcm16(input: Float32Array) {
+  const output = new Int16Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    output[index] = Math.round(clamp(input[index], -1, 1) * 32767);
+  }
+  return output;
+}
+
+function createRollingPcmBuffer(sampleRate = TARGET_SAMPLE_RATE): RollingPcmBuffer {
   return {
-    samples: new Int16Array(RECENT_AUDIO_SAMPLE_CAPACITY),
+    samples: new Int16Array(sampleRate * RECENT_AUDIO_SECONDS),
+    sampleRate,
     writeIndex: 0,
     length: 0,
   };
@@ -137,6 +146,15 @@ function clearRollingPcm(buffer: RollingPcmBuffer) {
   buffer.samples.fill(0);
   buffer.writeIndex = 0;
   buffer.length = 0;
+}
+
+function getReplayGain(pcm: Int16Array) {
+  let peak = 0;
+  for (let index = 0; index < pcm.length; index += 1) {
+    peak = Math.max(peak, Math.abs(pcm[index]));
+  }
+  if (peak === 0) return 1;
+  return Math.min(4, (0.9 * 32767) / peak);
 }
 
 function getMoodLevel(value: number): MoodLevel {
@@ -652,14 +670,16 @@ export function EmotionMonitor() {
     const audioContext = audioContextRef.current;
     if (!audioContext || audioContext.state === "closed") return false;
 
+    const { sampleRate } = rollingAudioRef.current;
     const pcm = snapshotRollingPcm(rollingAudioRef.current);
     if (pcm.length === 0) return false;
     clearRollingPcm(rollingAudioRef.current);
 
-    const audioBuffer = audioContext.createBuffer(1, pcm.length, TARGET_SAMPLE_RATE);
+    const audioBuffer = audioContext.createBuffer(1, pcm.length, sampleRate);
     const channelData = audioBuffer.getChannelData(0);
+    const replayGain = getReplayGain(pcm);
     for (let index = 0; index < pcm.length; index += 1) {
-      channelData[index] = pcm[index] / 32768;
+      channelData[index] = clamp((pcm[index] / 32768) * replayGain, -1, 1);
     }
 
     const source = audioContext.createBufferSource();
@@ -784,15 +804,18 @@ export function EmotionMonitor() {
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          autoGainControl: false,
-          echoCancellation: false,
-          noiseSuppression: false,
+          sampleRate: { ideal: 48_000 },
+          channelCount: { ideal: 1 },
+          autoGainControl: true,
+          echoCancellation: true,
+          noiseSuppression: true,
         },
       });
       streamRef.current = stream;
       const audioContext = new window.AudioContext();
       await audioContext.resume();
       audioContextRef.current = audioContext;
+      rollingAudioRef.current = createRollingPcmBuffer(audioContext.sampleRate);
       highEmotionRef.current = false;
       lastReminderAtRef.current = 0;
       setEmotionValue(0);
@@ -888,10 +911,10 @@ export function EmotionMonitor() {
         if (isPausedRef.current || isReplayingRef.current) return;
 
         const input = event.inputBuffer.getChannelData(0);
-        const pcm = resampleToPcm16(input, audioContext.sampleRate);
         if (reminderOptionRef.current === RECENT_AUDIO_REPLAY_ID) {
-          appendRollingPcm(rollingAudioRef.current, pcm);
+          appendRollingPcm(rollingAudioRef.current, float32ToPcm16(input));
         }
+        const pcm = resampleToPcm16(input, audioContext.sampleRate);
         if (
           !canSendAudioRef.current ||
           websocket.readyState !== WebSocket.OPEN ||
