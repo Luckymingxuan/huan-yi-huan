@@ -21,6 +21,7 @@ type MoodLevel = { label: string; hint: string; color: string; softColor: string
 const MAX_SAMPLES = 90;
 const DEFAULT_COLLAPSED_SAMPLE_LIMIT = 22;
 const COLLAPSED_BAR_STEP = 12;
+const AUTO_FOLLOW_RESUME_DISTANCE = 4;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -83,6 +84,12 @@ function EmotionChart({
   const ignoreClickRef = useRef(false);
   const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
   const latestSampleAt = samples.at(-1)?.recordedAt ?? 0;
+  const resumeFollowingIfAtEnd = (chart: HTMLDivElement) => {
+    const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
+    if (distanceFromEnd <= AUTO_FOLLOW_RESUME_DISTANCE) {
+      isFollowingLatestRef.current = true;
+    }
+  };
 
   useEffect(() => {
     if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
@@ -170,6 +177,7 @@ function EmotionChart({
         ignoreClickRef.current = drag.moved;
         horizontalDragRef.current = null;
         event.currentTarget.releasePointerCapture(event.pointerId);
+        resumeFollowingIfAtEnd(event.currentTarget);
         window.setTimeout(() => {
           ignoreClickRef.current = false;
         }, 0);
@@ -181,15 +189,18 @@ function EmotionChart({
       onTouchStart={() => {
         isFollowingLatestRef.current = false;
       }}
+      onTouchEnd={(event) => {
+        resumeFollowingIfAtEnd(event.currentTarget);
+      }}
       onWheel={(event) => {
         if (Math.abs(event.deltaX) > 0 || event.shiftKey) {
           isFollowingLatestRef.current = false;
+          const chart = event.currentTarget;
+          window.setTimeout(() => resumeFollowingIfAtEnd(chart), 80);
         }
       }}
       onScroll={(event) => {
-        const chart = event.currentTarget;
-        const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
-        if (distanceFromEnd < 24) isFollowingLatestRef.current = true;
+        resumeFollowingIfAtEnd(event.currentTarget);
       }}
     >
       <div className="flex h-full w-max min-w-full flex-col pl-1 pr-14">
