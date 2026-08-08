@@ -80,16 +80,48 @@ function EmotionChart({
 }) {
   const chartRef = useRef<HTMLDivElement>(null);
   const isFollowingLatestRef = useRef(true);
-  const horizontalDragRef = useRef<{ pointerId: number; startX: number; scrollLeft: number; moved: boolean } | null>(null);
+  const isSelectionLockedRef = useRef(false);
+  const touchDragRef = useRef(false);
+  const horizontalDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    scrollLeft: number;
+    moved: boolean;
+    selectedBar: HTMLButtonElement | null;
+    selectedIndex: number | null;
+  } | null>(null);
   const ignoreClickRef = useRef(false);
   const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
   const latestSampleAt = samples.at(-1)?.recordedAt ?? 0;
-  const resumeFollowingIfAtEnd = (chart: HTMLDivElement) => {
+  const resumeFollowingIfAtEnd = (chart: HTMLDivElement, releaseSelection = false) => {
     const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
-    if (distanceFromEnd <= AUTO_FOLLOW_RESUME_DISTANCE) {
+    if (
+      distanceFromEnd <= AUTO_FOLLOW_RESUME_DISTANCE &&
+      (!isSelectionLockedRef.current || releaseSelection)
+    ) {
+      isSelectionLockedRef.current = false;
       isFollowingLatestRef.current = true;
     }
   };
+  const selectSample = (index: number, selectedBar: HTMLButtonElement) => {
+    isSelectionLockedRef.current = true;
+    isFollowingLatestRef.current = false;
+    onSelect(index);
+
+    const chart = chartRef.current;
+    if (!chart) return;
+    const selectedCenter = selectedBar.offsetLeft + selectedBar.offsetWidth / 2;
+    chart.scrollTo({
+      left: selectedCenter - chart.clientWidth / 2,
+      behavior: "smooth",
+    });
+  };
+
+  useEffect(() => {
+    if (samples.length > 0) return;
+    isSelectionLockedRef.current = false;
+    isFollowingLatestRef.current = true;
+  }, [samples.length]);
 
   useEffect(() => {
     if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
@@ -154,11 +186,17 @@ function EmotionChart({
       aria-label="情绪值历史图表"
       onPointerDown={(event) => {
         if (event.pointerType !== "mouse" || event.button !== 0) return;
+        const eventTarget = event.target;
+        const selectedBar = eventTarget instanceof Element
+          ? eventTarget.closest<HTMLButtonElement>("button[data-sample-index]")
+          : null;
         horizontalDragRef.current = {
           pointerId: event.pointerId,
           startX: event.clientX,
           scrollLeft: event.currentTarget.scrollLeft,
           moved: false,
+          selectedBar,
+          selectedIndex: selectedBar ? Number(selectedBar.dataset.sampleIndex) : null,
         };
         event.currentTarget.setPointerCapture(event.pointerId);
       }}
@@ -174,10 +212,16 @@ function EmotionChart({
       onPointerUp={(event) => {
         const drag = horizontalDragRef.current;
         if (!drag || drag.pointerId !== event.pointerId) return;
-        ignoreClickRef.current = drag.moved;
+        ignoreClickRef.current = true;
         horizontalDragRef.current = null;
-        event.currentTarget.releasePointerCapture(event.pointerId);
-        resumeFollowingIfAtEnd(event.currentTarget);
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
+        if (drag.moved) {
+          resumeFollowingIfAtEnd(event.currentTarget, true);
+        } else if (drag.selectedBar && drag.selectedIndex !== null) {
+          selectSample(drag.selectedIndex, drag.selectedBar);
+        }
         window.setTimeout(() => {
           ignoreClickRef.current = false;
         }, 0);
@@ -187,16 +231,21 @@ function EmotionChart({
         ignoreClickRef.current = false;
       }}
       onTouchStart={() => {
+        touchDragRef.current = false;
         isFollowingLatestRef.current = false;
       }}
+      onTouchMove={() => {
+        touchDragRef.current = true;
+      }}
       onTouchEnd={(event) => {
-        resumeFollowingIfAtEnd(event.currentTarget);
+        resumeFollowingIfAtEnd(event.currentTarget, touchDragRef.current);
+        touchDragRef.current = false;
       }}
       onWheel={(event) => {
         if (Math.abs(event.deltaX) > 0 || event.shiftKey) {
           isFollowingLatestRef.current = false;
           const chart = event.currentTarget;
-          window.setTimeout(() => resumeFollowingIfAtEnd(chart), 80);
+          window.setTimeout(() => resumeFollowingIfAtEnd(chart, true), 80);
         }
       }}
       onScroll={(event) => {
@@ -221,12 +270,12 @@ function EmotionChart({
               <button
                 key={sample.recordedAt}
                 type="button"
+                data-sample-index={index}
                 className="group relative flex h-full w-2 shrink-0 animate-[emotion-bar-in_360ms_cubic-bezier(.22,1,.36,1)_both] items-end justify-center focus-visible:outline-none"
                 aria-label={`${formatClock(sample.recordedAt)}，情绪值 ${sample.value}`}
-                onClick={() => {
+                onClick={(event) => {
                   if (ignoreClickRef.current) return;
-                  isFollowingLatestRef.current = index === samples.length - 1;
-                  onSelect(index);
+                  selectSample(index, event.currentTarget);
                 }}
               >
                 {isSelected && (
