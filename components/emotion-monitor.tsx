@@ -13,6 +13,10 @@ import { MicOff, Pause, Play, Settings2 } from "lucide-react";
 
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
+  ConversationTranscript,
+  type TranscriptEntry,
+} from "@/components/conversation-transcript";
+import {
   ALARM_SENSITIVITY_STORAGE_KEY,
   DEFAULT_ALARM_SENSITIVITY,
   getAlarmThresholds,
@@ -41,6 +45,14 @@ type EmotionMessage = {
   emotions?: string[];
   mode?: string;
   probs?: number[];
+};
+type ConversationMessage = {
+  type?: string;
+  mode?: string;
+  spk?: number;
+  start_ms?: number;
+  end_ms?: number;
+  text?: string;
 };
 type RollingPcmBuffer = {
   samples: Float32Array;
@@ -599,6 +611,7 @@ function EmotionChart({
 export function EmotionMonitor() {
   const [emotionValue, setEmotionValue] = useState(0);
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [transcriptEntries, setTranscriptEntries] = useState<TranscriptEntry[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -617,12 +630,16 @@ export function EmotionMonitor() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const silentGainRef = useRef<GainNode | null>(null);
   const websocketRef = useRef<WebSocket | null>(null);
+  const transcriptWebsocketRef = useRef<WebSocket | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedSecondsRef = useRef(0);
   const dragStartYRef = useRef<number | null>(null);
   const isPausedRef = useRef(false);
   const canSendAudioRef = useRef(false);
+  const canSendTranscriptAudioRef = useRef(false);
   const emotionLabelsRef = useRef<string[]>([]);
+  const transcriptTimelineOffsetMsRef = useRef(0);
+  const transcriptSequenceRef = useRef(0);
   const reminderAudioRef = useRef<HTMLAudioElement | null>(null);
   const reminderOptionRef = useRef<ReminderOptionId>(RECENT_AUDIO_REPLAY_ID);
   const replayEffectRef = useRef<ReplayEffectId>(DEFAULT_REPLAY_EFFECT_ID);
@@ -691,6 +708,7 @@ export function EmotionMonitor() {
     }
     stopActiveReplay();
     canSendAudioRef.current = false;
+    canSendTranscriptAudioRef.current = false;
     emotionLabelsRef.current = [];
     const websocket = websocketRef.current;
     websocketRef.current = null;
@@ -701,6 +719,20 @@ export function EmotionMonitor() {
       websocket.onclose = null;
       if (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING) {
         websocket.close();
+      }
+    }
+    const transcriptWebsocket = transcriptWebsocketRef.current;
+    transcriptWebsocketRef.current = null;
+    if (transcriptWebsocket) {
+      transcriptWebsocket.onopen = null;
+      transcriptWebsocket.onmessage = null;
+      transcriptWebsocket.onerror = null;
+      transcriptWebsocket.onclose = null;
+      if (
+        transcriptWebsocket.readyState === WebSocket.OPEN ||
+        transcriptWebsocket.readyState === WebSocket.CONNECTING
+      ) {
+        transcriptWebsocket.close();
       }
     }
     if (processorRef.current) {
@@ -753,6 +785,11 @@ export function EmotionMonitor() {
     if (websocket?.readyState === WebSocket.OPEN) {
       websocket.send(JSON.stringify({ type: "reset" }));
     }
+    transcriptTimelineOffsetMsRef.current = elapsedSecondsRef.current * 1000;
+    const transcriptWebsocket = transcriptWebsocketRef.current;
+    if (transcriptWebsocket?.readyState === WebSocket.OPEN) {
+      transcriptWebsocket.send(JSON.stringify({ type: "reset" }));
+    }
 
     let replayBuffer = audioBuffer;
     if (pitchSemitones !== 0) {
@@ -802,6 +839,11 @@ export function EmotionMonitor() {
         const activeWebsocket = websocketRef.current;
         if (activeWebsocket?.readyState === WebSocket.OPEN) {
           activeWebsocket.send(JSON.stringify({ type: "reset" }));
+        }
+        transcriptTimelineOffsetMsRef.current = elapsedSecondsRef.current * 1000;
+        const activeTranscriptWebsocket = transcriptWebsocketRef.current;
+        if (activeTranscriptWebsocket?.readyState === WebSocket.OPEN) {
+          activeTranscriptWebsocket.send(JSON.stringify({ type: "reset" }));
         }
       }, REPLAY_FEEDBACK_GUARD_MS);
     };
@@ -979,16 +1021,19 @@ export function EmotionMonitor() {
       latestEmotionValueRef.current = 0;
       setEmotionValue(0);
       setSamples([]);
+      setTranscriptEntries([]);
       setSelectedIndex(null);
       setElapsedSeconds(0);
       elapsedSecondsRef.current = 0;
+      transcriptTimelineOffsetMsRef.current = 0;
+      transcriptSequenceRef.current = 0;
       isPausedRef.current = false;
       isReplayingRef.current = false;
       setIsPaused(false);
       setIsReplayPending(false);
       setIsReplaying(false);
 
-      const websocket = await new Promise<WebSocket>((resolve, reject) => {
+      const emotionWebsocketPromise = new Promise<WebSocket>((resolve, reject) => {
         const socket = new WebSocket(getEmotionWebSocketUrl());
         websocketRef.current = socket;
         let settled = false;
@@ -1056,6 +1101,90 @@ export function EmotionMonitor() {
         };
       });
 
+      const transcriptWebsocketPromise = new Promise<WebSocket>((resolve, reject) => {
+        const socket = new WebSocket(getEmotionWebSocketUrl());
+        transcriptWebsocketRef.current = socket;
+        let settled = false;
+        const connectionTimeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          socket.close();
+          reject(new Error("transcript-service-timeout"));
+        }, 10_000);
+
+        const failConnection = () => {
+          canSendTranscriptAudioRef.current = false;
+          if (!settled) {
+            settled = true;
+            window.clearTimeout(connectionTimeout);
+            reject(new Error("transcript-service-unavailable"));
+            return;
+          }
+          if (transcriptWebsocketRef.current !== socket) return;
+          stopListening();
+          setError("对话转写连接已断开，请检查服务后重试。");
+        };
+
+        socket.binaryType = "arraybuffer";
+        socket.onerror = () => {
+          if (!settled) failConnection();
+        };
+        socket.onclose = failConnection;
+        socket.onmessage = (event) => {
+          if (typeof event.data !== "string") return;
+
+          let message: ConversationMessage;
+          try {
+            message = JSON.parse(event.data) as ConversationMessage;
+          } catch {
+            return;
+          }
+
+          if (message.type === "ready") {
+            socket.send(JSON.stringify({ type: "mode", mode: "conversation" }));
+            return;
+          }
+
+          if (message.type === "ack" && message.mode === "conversation") {
+            canSendTranscriptAudioRef.current = true;
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(connectionTimeout);
+              resolve(socket);
+            }
+            return;
+          }
+
+          const text = message.text?.trim();
+          if (
+            message.type !== "utterance" ||
+            !text ||
+            !Number.isFinite(message.spk) ||
+            !Number.isFinite(message.start_ms) ||
+            !Number.isFinite(message.end_ms)
+          ) {
+            return;
+          }
+
+          const offsetSeconds = transcriptTimelineOffsetMsRef.current / 1000;
+          setTranscriptEntries((current) => [
+            ...current,
+            {
+              id: ++transcriptSequenceRef.current,
+              speaker: Math.max(0, Math.trunc(message.spk as number)),
+              startSeconds: offsetSeconds + (message.start_ms as number) / 1000,
+              endSeconds: offsetSeconds + (message.end_ms as number) / 1000,
+              text,
+            },
+          ]);
+        };
+      });
+
+      const [websocket, transcriptWebsocket] = await Promise.all([
+        emotionWebsocketPromise,
+        transcriptWebsocketPromise,
+      ]);
+
       const mediaSource = audioContext.createMediaStreamSource(stream);
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       const silentGain = audioContext.createGain();
@@ -1100,13 +1229,19 @@ export function EmotionMonitor() {
         }
         const pcm = resampleToPcm16(input, audioContext.sampleRate);
         if (
-          !canSendAudioRef.current ||
-          websocket.readyState !== WebSocket.OPEN ||
-          websocket.bufferedAmount > MAX_WEBSOCKET_BUFFER
+          canSendAudioRef.current &&
+          websocket.readyState === WebSocket.OPEN &&
+          websocket.bufferedAmount <= MAX_WEBSOCKET_BUFFER
         ) {
-          return;
+          websocket.send(pcm.buffer);
         }
-        websocket.send(pcm.buffer);
+        if (
+          canSendTranscriptAudioRef.current &&
+          transcriptWebsocket.readyState === WebSocket.OPEN &&
+          transcriptWebsocket.bufferedAmount <= MAX_WEBSOCKET_BUFFER
+        ) {
+          transcriptWebsocket.send(pcm.buffer);
+        }
       };
 
       setIsListening(true);
@@ -1120,12 +1255,14 @@ export function EmotionMonitor() {
         cause instanceof DOMException &&
         (cause.name === "NotAllowedError" || cause.name === "PermissionDeniedError");
       const serviceUnavailable =
-        cause instanceof Error && cause.message.startsWith("emotion-service-");
+        cause instanceof Error &&
+        (cause.message.startsWith("emotion-service-") ||
+          cause.message.startsWith("transcript-service-"));
       setError(
         permissionDenied
           ? "没有获得麦克风权限。请在浏览器设置中允许后重试。"
           : serviceUnavailable
-            ? "无法连接情绪识别服务，请确认 FastAPI 服务可用后重试。"
+            ? "无法连接情绪识别与转写服务，请确认 FastAPI 服务可用后重试。"
           : "暂时无法使用麦克风，请检查设备后重试。",
       );
       stopListening();
@@ -1154,6 +1291,10 @@ export function EmotionMonitor() {
     stopActiveReplay();
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
       websocketRef.current.send(JSON.stringify({ type: "reset" }));
+    }
+    transcriptTimelineOffsetMsRef.current = elapsedSecondsRef.current * 1000;
+    if (transcriptWebsocketRef.current?.readyState === WebSocket.OPEN) {
+      transcriptWebsocketRef.current.send(JSON.stringify({ type: "reset" }));
     }
     await audioContext.suspend();
     reminderAudioRef.current?.pause();
@@ -1380,9 +1521,12 @@ export function EmotionMonitor() {
               <span className="text-sm text-neutral-400">情绪值</span>
             </div>
             <p className="mt-2 text-sm tabular-nums text-neutral-400">{selectedSample ? formatClock(selectedSample.recordedAt) : "等待第一条记录"}</p>
-            <div className="mx-auto mt-8 h-px w-12 bg-neutral-200" />
-            <p className="mt-8 text-lg font-medium tracking-tight">此刻发生了什么？</p>
-            <p className="mx-auto mt-2 max-w-64 text-sm leading-6 text-neutral-400">不急着回答。先看见它，然后缓一缓。</p>
+            <ConversationTranscript
+              entries={transcriptEntries}
+              targetSeconds={selectedSample?.elapsedSeconds ?? null}
+              isListening={isListening}
+              isPaused={isPaused}
+            />
           </div>
         </div>
       </section>
