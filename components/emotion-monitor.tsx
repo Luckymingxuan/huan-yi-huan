@@ -55,8 +55,8 @@ const COLLAPSED_BAR_STEP = 12;
 const AUTO_FOLLOW_RESUME_DISTANCE = 4;
 const TARGET_SAMPLE_RATE = 16_000;
 const RECENT_AUDIO_SECONDS = 10;
-const REPLAY_CAPTURE_TAIL_MS = 5_000;
 const REPLAY_MIN_CAPTURE_TAIL_MS = 2_500;
+const REPLAY_HARD_CAPTURE_TAIL_MS = 8_000;
 const REPLAY_QUIET_HOLD_MS = 600;
 const REPLAY_MIN_QUIET_RMS = 0.008;
 const REPLAY_MAX_QUIET_RMS = 0.025;
@@ -634,6 +634,11 @@ export function EmotionMonitor() {
   const replayPendingStartedAtRef = useRef<number | null>(null);
   const replayQuietSinceRef = useRef<number | null>(null);
   const replayPeakRmsRef = useRef(0);
+  const latestEmotionValueRef = useRef(0);
+  const replayPeakEmotionRef = useRef(0);
+  const replayLastEmotionRef = useRef<number | null>(null);
+  const replayDeclineStepsRef = useRef(0);
+  const replayEmotionDecliningRef = useRef(false);
   const isReplayingRef = useRef(false);
   const highEmotionRef = useRef(false);
   const lastReminderAtRef = useRef(0);
@@ -654,6 +659,10 @@ export function EmotionMonitor() {
     replayPendingStartedAtRef.current = null;
     replayQuietSinceRef.current = null;
     replayPeakRmsRef.current = 0;
+    replayPeakEmotionRef.current = 0;
+    replayLastEmotionRef.current = null;
+    replayDeclineStepsRef.current = 0;
+    replayEmotionDecliningRef.current = false;
     if (replayResumeTimerRef.current !== null) {
       clearTimeout(replayResumeTimerRef.current);
       replayResumeTimerRef.current = null;
@@ -807,6 +816,10 @@ export function EmotionMonitor() {
     replayPendingStartedAtRef.current = null;
     replayQuietSinceRef.current = null;
     replayPeakRmsRef.current = 0;
+    replayPeakEmotionRef.current = 0;
+    replayLastEmotionRef.current = null;
+    replayDeclineStepsRef.current = 0;
+    replayEmotionDecliningRef.current = false;
     setIsReplayPending(false);
     void replayRecentAudio();
     return true;
@@ -830,10 +843,14 @@ export function EmotionMonitor() {
     replayPendingStartedAtRef.current = performance.now();
     replayQuietSinceRef.current = null;
     replayPeakRmsRef.current = 0;
+    replayPeakEmotionRef.current = latestEmotionValueRef.current;
+    replayLastEmotionRef.current = latestEmotionValueRef.current;
+    replayDeclineStepsRef.current = 0;
+    replayEmotionDecliningRef.current = false;
     setIsReplayPending(true);
     replayStartTimerRef.current = window.setTimeout(() => {
       finishPendingReplay();
-    }, REPLAY_CAPTURE_TAIL_MS);
+    }, REPLAY_HARD_CAPTURE_TAIL_MS);
     return true;
   }, [finishPendingReplay]);
 
@@ -841,6 +858,23 @@ export function EmotionMonitor() {
     if (isPausedRef.current || isReplayingRef.current) return;
     const nextValue = getNegativeEmotionValue(probs, emotionLabelsRef.current);
     if (nextValue === null) return;
+    latestEmotionValueRef.current = nextValue;
+
+    if (replayStartTimerRef.current !== null) {
+      replayPeakEmotionRef.current = Math.max(replayPeakEmotionRef.current, nextValue);
+      const previousValue = replayLastEmotionRef.current;
+      if (previousValue !== null) {
+        if (nextValue <= previousValue - 1) {
+          replayDeclineStepsRef.current += 1;
+        } else if (nextValue >= previousValue + 1) {
+          replayDeclineStepsRef.current = 0;
+        }
+      }
+      replayEmotionDecliningRef.current =
+        replayPeakEmotionRef.current - nextValue >= 4 ||
+        replayDeclineStepsRef.current >= 2;
+      replayLastEmotionRef.current = nextValue;
+    }
 
     const { trigger, rearm } = alarmThresholdsRef.current;
     if (nextValue >= trigger) {
@@ -942,6 +976,7 @@ export function EmotionMonitor() {
       rollingAudioRef.current = createRollingPcmBuffer(audioContext.sampleRate);
       highEmotionRef.current = false;
       lastReminderAtRef.current = 0;
+      latestEmotionValueRef.current = 0;
       setEmotionValue(0);
       setSamples([]);
       setSelectedIndex(null);
@@ -1051,7 +1086,10 @@ export function EmotionMonitor() {
             );
             if (rms <= quietThreshold) {
               replayQuietSinceRef.current ??= now;
-              if (now - replayQuietSinceRef.current >= REPLAY_QUIET_HOLD_MS) {
+              if (
+                now - replayQuietSinceRef.current >= REPLAY_QUIET_HOLD_MS &&
+                replayEmotionDecliningRef.current
+              ) {
                 finishPendingReplay();
                 return;
               }
