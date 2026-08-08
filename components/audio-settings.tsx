@@ -137,7 +137,7 @@ export function AudioSettings() {
               )}
             </span>
             <span className="min-w-0">
-              <span className="block font-medium tracking-tight">回放刚才 8 秒</span>
+              <span className="block font-medium tracking-tight">回放刚才 10 秒</span>
               <span className="mt-0.5 block text-xs text-neutral-400">只在本机内存中滚动保留</span>
             </span>
           </button>
@@ -195,7 +195,7 @@ export function AudioSettings() {
       </section>
 
       <p className="mt-8 text-center text-xs leading-5 text-neutral-400">
-        默认回放刚才 8 秒。四种方式不会同时播放，选择只保存在当前设备。
+        默认回放刚才 10 秒。四种方式不会同时播放，选择只保存在当前设备。
       </p>
     </main>
   );
