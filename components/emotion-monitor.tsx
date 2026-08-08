@@ -8,7 +8,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Mic, MicOff } from "lucide-react";
+import { MicOff, Pause, Play } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -182,6 +182,7 @@ export function EmotionMonitor() {
   const [samples, setSamples] = useState<Sample[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isListening, setIsListening] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -196,6 +197,7 @@ export function EmotionMonitor() {
   const lastVisualUpdateRef = useRef(0);
   const lastSampleRef = useRef(0);
   const dragStartYRef = useRef<number | null>(null);
+  const isPausedRef = useRef(false);
 
   const mood = getMoodLevel(emotionValue);
   const selectedSample = useMemo(() => {
@@ -216,6 +218,8 @@ export function EmotionMonitor() {
     streamRef.current = null;
     void audioContextRef.current?.close();
     audioContextRef.current = null;
+    isPausedRef.current = false;
+    setIsPaused(false);
     setIsListening(false);
   }, []);
 
@@ -254,6 +258,8 @@ export function EmotionMonitor() {
       setSamples([]);
       setSelectedIndex(null);
       setElapsedSeconds(0);
+      isPausedRef.current = false;
+      setIsPaused(false);
       setIsListening(true);
 
       elapsedTimerRef.current = setInterval(() => {
@@ -261,6 +267,11 @@ export function EmotionMonitor() {
       }, 1000);
 
       const readLevel = (timestamp: number) => {
+        if (isPausedRef.current) {
+          animationFrameRef.current = requestAnimationFrame(readLevel);
+          return;
+        }
+
         analyser.getFloatTimeDomainData(waveform);
         let squareSum = 0;
         for (const point of waveform) squareSum += point * point;
@@ -300,6 +311,29 @@ export function EmotionMonitor() {
     }
   };
 
+  const togglePause = async () => {
+    const audioContext = audioContextRef.current;
+    if (!audioContext) return;
+
+    if (isPausedRef.current) {
+      await audioContext.resume();
+      isPausedRef.current = false;
+      setIsPaused(false);
+      elapsedTimerRef.current = setInterval(() => {
+        setElapsedSeconds((seconds) => seconds + 1);
+      }, 1000);
+      return;
+    }
+
+    await audioContext.suspend();
+    isPausedRef.current = true;
+    setIsPaused(true);
+    if (elapsedTimerRef.current !== null) {
+      clearInterval(elapsedTimerRef.current);
+      elapsedTimerRef.current = null;
+    }
+  };
+
   const handleSheetPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     dragStartYRef.current = event.clientY;
     setIsDragging(true);
@@ -335,8 +369,8 @@ export function EmotionMonitor() {
           <p className="mt-0.5 text-[11px] font-medium tracking-[0.08em] text-neutral-400">HUAN YI HUAN</p>
         </div>
         <div className="flex items-center gap-2 rounded-full bg-white/75 px-3 py-2 text-xs font-medium text-neutral-500 shadow-sm ring-1 ring-black/[0.04] backdrop-blur-xl">
-          <span className={cn("size-1.5 rounded-full", isListening ? "animate-pulse bg-emerald-500" : "bg-neutral-300")} />
-          {isListening ? "正在倾听" : "等待开始"}
+          <span className={cn("size-1.5 rounded-full", isListening && !isPaused ? "animate-pulse bg-emerald-500" : isPaused ? "bg-amber-400" : "bg-neutral-300")} />
+          {isListening ? isPaused ? "已暂停" : "正在倾听" : "等待开始"}
         </div>
       </header>
 
@@ -380,27 +414,46 @@ export function EmotionMonitor() {
 
         {isListening && (
           <p className={cn("absolute top-[calc(100%+2rem)] text-sm text-neutral-500 transition-all duration-500", expanded ? "-translate-y-3 opacity-0" : "opacity-100")}>
-            {mood.hint}
+            {isPaused ? "记录已暂停" : mood.hint}
           </p>
         )}
       </section>
 
-      {!isListening && !expanded && (
+      {!expanded && (
         <div className="absolute inset-x-0 bottom-[calc(112px+1.25rem+env(safe-area-inset-bottom))] z-10 flex flex-col items-center">
-          {error ? (
+          {isListening ? (
+            <div className="flex items-center justify-center gap-3">
+              <Button
+                variant="outline"
+                size="icon-lg"
+                className="size-12 animate-[control-peel-left_500ms_cubic-bezier(.22,1,.36,1)_both] rounded-full bg-white shadow-[0_10px_26px_rgba(0,0,0,0.09)]"
+                aria-label={isPaused ? "继续记录" : "暂停记录"}
+                title={isPaused ? "继续记录" : "暂停记录"}
+                onClick={togglePause}
+              >
+                {isPaused ? <Play className="fill-current" /> : <Pause className="fill-current" />}
+              </Button>
+              <Button
+                size="lg"
+                className="h-12 w-36 animate-[control-peel-right_500ms_cubic-bezier(.22,1,.36,1)_both] rounded-full px-6 shadow-[0_12px_30px_rgba(0,0,0,0.12)]"
+                onClick={stopListening}
+              >
+                结束记录
+              </Button>
+            </div>
+          ) : error ? (
             <div className="max-w-72 rounded-2xl bg-white/90 p-4 text-center shadow-sm ring-1 ring-black/[0.04] backdrop-blur-xl">
               <MicOff className="mx-auto mb-2 size-4 text-neutral-400" />
               <p className="text-xs leading-5 text-neutral-500">{error}</p>
               <Button variant="ghost" size="sm" className="mt-2" onClick={startListening}>再试一次</Button>
             </div>
           ) : (
-            <>
-              <Button size="lg" className="h-12 rounded-full px-6 shadow-[0_12px_30px_rgba(0,0,0,0.12)]" disabled={isStarting} onClick={startListening}>
-                <Mic data-icon="inline-start" />
+            <div className="flex flex-col items-center">
+              <p className="mb-3 text-sm font-medium tracking-tight text-neutral-500">或许我可以帮帮你</p>
+              <Button size="lg" className="h-12 w-40 animate-[control-merge_400ms_cubic-bezier(.22,1,.36,1)_both] rounded-full px-6 shadow-[0_12px_30px_rgba(0,0,0,0.12)]" disabled={isStarting} onClick={startListening}>
                 {isStarting ? "正在连接…" : "开始记录"}
               </Button>
-              <p className="mt-2 max-w-56 text-center text-[11px] leading-4 text-neutral-400">声音仅在设备上分析，不会保存或上传</p>
-            </>
+            </div>
           )}
         </div>
       )}
