@@ -30,6 +30,8 @@ const COLLAPSED_BAR_STEP = 12;
 const AUTO_FOLLOW_RESUME_DISTANCE = 4;
 const TARGET_SAMPLE_RATE = 16_000;
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
+const ALARM_TRIGGER_VALUE = 52;
+const ALARM_REARM_VALUE = 46;
 const FASTAPI_HOST = process.env.NEXT_PUBLIC_FASTAPI_HOST?.trim() || "127.0.0.1";
 const FASTAPI_PORT = process.env.NEXT_PUBLIC_FASTAPI_PORT?.trim() || "8000";
 
@@ -477,7 +479,7 @@ export function EmotionMonitor() {
     const nextValue = getNegativeEmotionValue(probs, emotionLabelsRef.current);
     if (nextValue === null) return;
 
-    if (nextValue >= 72) {
+    if (nextValue >= ALARM_TRIGGER_VALUE) {
       const now = Date.now();
       if (!highEmotionRef.current && now - lastReminderAtRef.current >= 10_000) {
         const reminderAudio = reminderAudioRef.current;
@@ -488,7 +490,7 @@ export function EmotionMonitor() {
         lastReminderAtRef.current = now;
       }
       highEmotionRef.current = true;
-    } else if (nextValue < 64) {
+    } else if (nextValue < ALARM_REARM_VALUE) {
       highEmotionRef.current = false;
     }
 
