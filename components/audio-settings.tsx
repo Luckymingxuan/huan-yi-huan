@@ -24,6 +24,14 @@ import {
   type ReminderAudioId,
   type ReminderOptionId,
 } from "@/lib/reminder-audio";
+import {
+  DEFAULT_REPLAY_EFFECT_ID,
+  getReplayEffectId,
+  REPLAY_EFFECT_CHANGE_EVENT,
+  REPLAY_EFFECT_OPTIONS,
+  REPLAY_EFFECT_STORAGE_KEY,
+  type ReplayEffectId,
+} from "@/lib/replay-effect";
 
 const REMINDER_AUDIO_CHANGE_EVENT = "huan-yi-huan-reminder-audio-change";
 
@@ -61,6 +69,23 @@ function getStoredAlarmSensitivity() {
   }
 }
 
+function subscribeToReplayEffect(onStoreChange: () => void) {
+  window.addEventListener("storage", onStoreChange);
+  window.addEventListener(REPLAY_EFFECT_CHANGE_EVENT, onStoreChange);
+  return () => {
+    window.removeEventListener("storage", onStoreChange);
+    window.removeEventListener(REPLAY_EFFECT_CHANGE_EVENT, onStoreChange);
+  };
+}
+
+function getStoredReplayEffect() {
+  try {
+    return getReplayEffectId(window.localStorage.getItem(REPLAY_EFFECT_STORAGE_KEY));
+  } catch {
+    return DEFAULT_REPLAY_EFFECT_ID;
+  }
+}
+
 export function AudioSettings() {
   const [playingId, setPlayingId] = useState<ReminderAudioId | null>(null);
   const previewRef = useRef<HTMLAudioElement | null>(null);
@@ -73,6 +98,11 @@ export function AudioSettings() {
     subscribeToAlarmSensitivity,
     getStoredAlarmSensitivity,
     () => DEFAULT_ALARM_SENSITIVITY,
+  );
+  const replayEffect = useSyncExternalStore(
+    subscribeToReplayEffect,
+    getStoredReplayEffect,
+    () => DEFAULT_REPLAY_EFFECT_ID,
   );
 
   useEffect(() => {
@@ -93,6 +123,11 @@ export function AudioSettings() {
   const changeAlarmSensitivity = (value: number) => {
     window.localStorage.setItem(ALARM_SENSITIVITY_STORAGE_KEY, String(value));
     window.dispatchEvent(new Event(ALARM_SENSITIVITY_CHANGE_EVENT));
+  };
+
+  const changeReplayEffect = (id: ReplayEffectId) => {
+    window.localStorage.setItem(REPLAY_EFFECT_STORAGE_KEY, id);
+    window.dispatchEvent(new Event(REPLAY_EFFECT_CHANGE_EVENT));
   };
 
   const togglePreview = async (id: ReminderAudioId) => {
@@ -226,6 +261,53 @@ export function AudioSettings() {
           );
         })}
       </section>
+
+      {selectedId === RECENT_AUDIO_REPLAY_ID && (
+        <section className="mt-10" aria-labelledby="replay-effect-title">
+          <p className="text-xs font-medium tracking-[0.12em] text-neutral-400">VOICE EFFECT</p>
+          <h2 id="replay-effect-title" className="mt-2 text-xl font-semibold tracking-tight">
+            回放音效
+          </h2>
+          <p className="mt-2 text-sm leading-6 text-neutral-500">
+            只改变本地回放的听感，不影响情绪识别。
+          </p>
+
+          <div className="mt-5 grid grid-cols-2 gap-3">
+            {REPLAY_EFFECT_OPTIONS.map((option) => {
+              const selected = option.id === replayEffect;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => changeReplayEffect(option.id)}
+                  className={cn(
+                    "min-h-28 rounded-[1.5rem] bg-white p-4 text-left shadow-sm ring-1 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-950",
+                    selected ? "ring-neutral-950/20" : "ring-black/[0.04]",
+                  )}
+                >
+                  <span className="flex items-center gap-2 font-medium">
+                    <span
+                      className={cn(
+                        "grid size-5 shrink-0 place-items-center rounded-full border",
+                        selected
+                          ? "border-neutral-950 bg-neutral-950 text-white"
+                          : "border-neutral-200",
+                      )}
+                    >
+                      {selected && <Check className="size-3" strokeWidth={2.5} />}
+                    </span>
+                    {option.label}
+                  </span>
+                  <span className="mt-2 block text-xs leading-5 text-neutral-400">
+                    {option.description}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       <section className="mt-10" aria-labelledby="alarm-sensitivity-title">
         <div className="flex items-end justify-between gap-4">

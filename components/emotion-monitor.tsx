@@ -25,6 +25,13 @@ import {
   REMINDER_AUDIO_STORAGE_KEY,
   type ReminderOptionId,
 } from "@/lib/reminder-audio";
+import {
+  DEFAULT_REPLAY_EFFECT_ID,
+  getReplayEffectId,
+  getReplayPitchSemitones,
+  REPLAY_EFFECT_STORAGE_KEY,
+  type ReplayEffectId,
+} from "@/lib/replay-effect";
 import { cn } from "@/lib/utils";
 
 type Sample = { value: number; recordedAt: number; elapsedSeconds: number };
@@ -49,6 +56,7 @@ const TARGET_SAMPLE_RATE = 16_000;
 const RECENT_AUDIO_SECONDS = 10;
 const REPLAY_CAPTURE_TAIL_MS = 5_000;
 const REPLAY_FEEDBACK_GUARD_MS = 250;
+const SOUNDTOUCH_PROCESSOR_URL = "/audio/soundtouch-processor.js";
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
 const FASTAPI_HOST = process.env.NEXT_PUBLIC_FASTAPI_HOST?.trim() || "127.0.0.1";
 const FASTAPI_PORT = process.env.NEXT_PUBLIC_FASTAPI_PORT?.trim() || "8000";
@@ -586,8 +594,10 @@ export function EmotionMonitor() {
   const emotionLabelsRef = useRef<string[]>([]);
   const reminderAudioRef = useRef<HTMLAudioElement | null>(null);
   const reminderOptionRef = useRef<ReminderOptionId>(RECENT_AUDIO_REPLAY_ID);
+  const replayEffectRef = useRef<ReplayEffectId>(DEFAULT_REPLAY_EFFECT_ID);
   const rollingAudioRef = useRef<RollingPcmBuffer>(createRollingPcmBuffer());
   const replaySourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const replayRequestIdRef = useRef(0);
   const replayStartTimerRef = useRef<number | null>(null);
   const replayResumeTimerRef = useRef<number | null>(null);
   const isReplayingRef = useRef(false);
@@ -602,6 +612,7 @@ export function EmotionMonitor() {
   }, [samples, selectedIndex]);
 
   const stopActiveReplay = useCallback(() => {
+    replayRequestIdRef.current += 1;
     if (replayStartTimerRef.current !== null) {
       clearTimeout(replayStartTimerRef.current);
       replayStartTimerRef.current = null;
@@ -671,9 +682,10 @@ export function EmotionMonitor() {
 
   useEffect(() => stopListening, [stopListening]);
 
-  const replayRecentAudio = useCallback(() => {
+  const replayRecentAudio = useCallback(async () => {
     const audioContext = audioContextRef.current;
     if (!audioContext || audioContext.state === "closed") return false;
+    const requestId = ++replayRequestIdRef.current;
 
     const { sampleRate } = rollingAudioRef.current;
     const pcm = snapshotRollingPcm(rollingAudioRef.current);
@@ -687,10 +699,7 @@ export function EmotionMonitor() {
       channelData[index] = clamp((pcm[index] / 32768) * replayGain, -1, 1);
     }
 
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    replaySourceRef.current = source;
+    const pitchSemitones = getReplayPitchSemitones(replayEffectRef.current);
     isReplayingRef.current = true;
     setIsReplaying(true);
 
@@ -698,6 +707,34 @@ export function EmotionMonitor() {
     if (websocket?.readyState === WebSocket.OPEN) {
       websocket.send(JSON.stringify({ type: "reset" }));
     }
+
+    let replayBuffer = audioBuffer;
+    if (pitchSemitones !== 0) {
+      try {
+        const { processOffline } = await import("@soundtouchjs/audio-worklet");
+        replayBuffer = await processOffline({
+          input: audioBuffer,
+          processorUrl: SOUNDTOUCH_PROCESSOR_URL,
+          pitchSemitones,
+          playbackRate: 1,
+        });
+      } catch {
+        setError("变声音效处理失败，已使用原声。请通过 localhost 或 HTTPS 打开页面。");
+      }
+    }
+
+    if (
+      replayRequestIdRef.current !== requestId ||
+      audioContextRef.current !== audioContext ||
+      !isReplayingRef.current
+    ) {
+      return false;
+    }
+
+    const source = audioContext.createBufferSource();
+    source.buffer = replayBuffer;
+    source.connect(audioContext.destination);
+    replaySourceRef.current = source;
 
     source.onended = () => {
       if (replaySourceRef.current !== source) return;
@@ -730,7 +767,7 @@ export function EmotionMonitor() {
     replayStartTimerRef.current = window.setTimeout(() => {
       replayStartTimerRef.current = null;
       setIsReplayPending(false);
-      replayRecentAudio();
+      void replayRecentAudio();
     }, REPLAY_CAPTURE_TAIL_MS);
     return true;
   }, [replayRecentAudio]);
@@ -790,6 +827,13 @@ export function EmotionMonitor() {
       }
       const reminderOption = getReminderOptionId(savedReminderId);
       reminderOptionRef.current = reminderOption;
+      let savedReplayEffectId: string | null = null;
+      try {
+        savedReplayEffectId = window.localStorage.getItem(REPLAY_EFFECT_STORAGE_KEY);
+      } catch {
+        // Storage can be unavailable in restrictive browser modes; use the default.
+      }
+      replayEffectRef.current = getReplayEffectId(savedReplayEffectId);
       let savedAlarmSensitivity: string | null = null;
       try {
         savedAlarmSensitivity = window.localStorage.getItem(ALARM_SENSITIVITY_STORAGE_KEY);
