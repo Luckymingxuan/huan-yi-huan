@@ -763,12 +763,12 @@ export function EmotionMonitor() {
           processorUrl: SOUNDTOUCH_PROCESSOR_URL,
           pitchSemitones,
           playbackRate: 1,
-          formantStrength: 0.7,
+          formantStrength: 0.35,
           interpolationStrategy: "lanczos",
           stretchParameters: {
             sequenceMs: 40,
-            seekWindowMs: 15,
-            overlapMs: 8,
+            seekWindowMs: 30,
+            overlapMs: 12,
             quickSeek: false,
           },
         });
