@@ -1,5 +1,7 @@
 export const REMINDER_AUDIO_STORAGE_KEY = "huan-yi-huan-reminder-audio";
 export const DEFAULT_REMINDER_AUDIO_ID = "fire-alarm";
+export const RECENT_AUDIO_REPLAY_ID = "recent-audio-replay";
+export const DEFAULT_REMINDER_OPTION_ID = RECENT_AUDIO_REPLAY_ID;
 
 export const REMINDER_AUDIO_OPTIONS = [
   {
@@ -23,6 +25,16 @@ export const REMINDER_AUDIO_OPTIONS = [
 ] as const;
 
 export type ReminderAudioId = (typeof REMINDER_AUDIO_OPTIONS)[number]["id"];
+export type ReminderOptionId = ReminderAudioId | typeof RECENT_AUDIO_REPLAY_ID;
+
+export function isReminderAudioId(id: string | null | undefined): id is ReminderAudioId {
+  return REMINDER_AUDIO_OPTIONS.some((option) => option.id === id);
+}
+
+export function getReminderOptionId(id: string | null | undefined): ReminderOptionId {
+  if (id === RECENT_AUDIO_REPLAY_ID || isReminderAudioId(id)) return id;
+  return DEFAULT_REMINDER_OPTION_ID;
+}
 
 export function getReminderAudio(id: string | null | undefined) {
   return (

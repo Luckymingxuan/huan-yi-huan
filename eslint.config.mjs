@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Unmodified third-party AudioWorklet distributed by SoundTouchJS.
+    "public/audio/formant-correction-processor.js",
   ]),
 ]);
 
