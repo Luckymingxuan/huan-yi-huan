@@ -79,6 +79,8 @@ function EmotionChart({
 }) {
   const chartRef = useRef<HTMLDivElement>(null);
   const isFollowingLatestRef = useRef(true);
+  const horizontalDragRef = useRef<{ pointerId: number; startX: number; scrollLeft: number; moved: boolean } | null>(null);
+  const ignoreClickRef = useRef(false);
   const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
 
   useEffect(() => {
@@ -140,57 +142,107 @@ function EmotionChart({
   return (
     <div
       ref={chartRef}
-      className="relative h-52 w-full touch-pan-x overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="relative h-56 w-full touch-pan-x cursor-grab select-none overflow-x-auto overflow-y-hidden active:cursor-grabbing [mask-image:linear-gradient(to_right,transparent_0,black_24px,black_calc(100%-24px),transparent_100%)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       aria-label="情绪值历史图表"
+      onPointerDown={(event) => {
+        if (event.pointerType !== "mouse" || event.button !== 0) return;
+        horizontalDragRef.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          scrollLeft: event.currentTarget.scrollLeft,
+          moved: false,
+        };
+        event.currentTarget.setPointerCapture(event.pointerId);
+      }}
+      onPointerMove={(event) => {
+        const drag = horizontalDragRef.current;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const delta = event.clientX - drag.startX;
+        if (Math.abs(delta) > 3) drag.moved = true;
+        if (!drag.moved) return;
+        event.currentTarget.scrollLeft = drag.scrollLeft - delta;
+        isFollowingLatestRef.current = false;
+      }}
+      onPointerUp={(event) => {
+        const drag = horizontalDragRef.current;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        ignoreClickRef.current = drag.moved;
+        horizontalDragRef.current = null;
+        event.currentTarget.releasePointerCapture(event.pointerId);
+        window.setTimeout(() => {
+          ignoreClickRef.current = false;
+        }, 0);
+      }}
+      onPointerCancel={() => {
+        horizontalDragRef.current = null;
+        ignoreClickRef.current = false;
+      }}
       onScroll={(event) => {
         const chart = event.currentTarget;
         const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
         isFollowingLatestRef.current = distanceFromEnd < 24;
       }}
     >
-      <div className="flex h-full w-max min-w-full items-end gap-1.5 px-1">
-        {samples.length === 0 ? (
-          Array.from({ length: 16 }, (_, index) => (
-            <span
-              key={index}
-              className="w-2 shrink-0 rounded-full bg-neutral-200/70"
-              style={{ height: `${18 + ((index * 13) % 28)}%` }}
-            />
-          ))
-        ) : samples.map((sample, index) => {
-          const mood = getMoodLevel(sample.value);
-          const isSelected = index === selectedIndex;
+      <div className="flex h-full w-max min-w-full flex-col px-1">
+        <div className="flex min-h-0 flex-1 items-end gap-1.5">
+          {samples.length === 0 ? (
+            Array.from({ length: 16 }, (_, index) => (
+              <span
+                key={index}
+                className="w-2 shrink-0 rounded-full bg-neutral-200/70"
+                style={{ height: `${18 + ((index * 13) % 28)}%` }}
+              />
+            ))
+          ) : samples.map((sample, index) => {
+            const mood = getMoodLevel(sample.value);
+            const isSelected = index === selectedIndex;
 
-          return (
-            <button
-              key={`${sample.recordedAt}-${index}`}
-              type="button"
-              className="group relative flex h-full w-2 shrink-0 items-end justify-center focus-visible:outline-none"
-              aria-label={`${formatClock(sample.recordedAt)}，情绪值 ${sample.value}`}
-              onClick={() => {
-                isFollowingLatestRef.current = index === samples.length - 1;
-                onSelect(index);
-              }}
-            >
-              {isSelected && (
+            return (
+              <button
+                key={sample.recordedAt}
+                type="button"
+                className="group relative flex h-full w-2 shrink-0 animate-[emotion-bar-in_360ms_cubic-bezier(.22,1,.36,1)_both] items-end justify-center focus-visible:outline-none"
+                aria-label={`${formatClock(sample.recordedAt)}，情绪值 ${sample.value}`}
+                onClick={() => {
+                  if (ignoreClickRef.current) return;
+                  isFollowingLatestRef.current = index === samples.length - 1;
+                  onSelect(index);
+                }}
+              >
+                {isSelected && (
+                  <span
+                    className="absolute z-10 size-2.5 -translate-y-2 rounded-full bg-neutral-950 shadow-[0_0_0_4px_rgba(255,255,255,0.9)]"
+                    style={{ bottom: `${Math.max(sample.value, 5)}%` }}
+                  />
+                )}
                 <span
-                  className="absolute z-10 size-2.5 -translate-y-2 rounded-full bg-neutral-950 shadow-[0_0_0_4px_rgba(255,255,255,0.9)]"
-                  style={{ bottom: `${Math.max(sample.value, 5)}%` }}
+                  className={cn(
+                    "w-full rounded-full transition-[height,opacity] duration-300",
+                    isSelected ? "opacity-100" : "opacity-75 group-hover:opacity-100",
+                  )}
+                  style={{
+                    height: `${Math.max(sample.value, 5)}%`,
+                    backgroundColor: mood.color,
+                  }}
                 />
-              )}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="relative mt-3 flex h-2 shrink-0 items-end gap-1.5 opacity-60" aria-hidden="true">
+          <div className="absolute inset-x-0 bottom-0 h-px bg-neutral-300" />
+          {Array.from({ length: samples.length || 16 }, (_, index) => (
+            <span key={index} className="grid w-2 shrink-0 place-items-center">
               <span
                 className={cn(
-                  "w-full rounded-full transition-[height,opacity] duration-300",
-                  isSelected ? "opacity-100" : "opacity-75 group-hover:opacity-100",
+                  "relative w-px bg-neutral-300",
+                  index % 6 === 0 ? "h-2" : index % 3 === 0 ? "h-1.5" : "h-1",
                 )}
-                style={{
-                  height: `${Math.max(sample.value, 5)}%`,
-                  backgroundColor: mood.color,
-                }}
               />
-            </button>
-          );
-        })}
+            </span>
+          ))}
+        </div>
       </div>
     </div>
   );
