@@ -90,15 +90,44 @@ function EmotionChart({
     selectFromPointer(event.clientX);
   };
 
+  if (!expanded) {
+    const recentSamples = samples.slice(-32);
+    const streamKey = recentSamples.at(-1)?.recordedAt ?? "empty";
+
+    return (
+      <div className="relative h-14 w-full overflow-hidden px-1" aria-label="最近情绪值">
+        <div
+          key={streamKey}
+          className="flex h-full w-full animate-[emotion-stream_500ms_linear] items-end justify-end gap-1.5"
+        >
+          {recentSamples.length === 0
+            ? Array.from({ length: 24 }, (_, index) => (
+                <span
+                  key={index}
+                  className="h-3 w-1.5 shrink-0 rounded-full bg-neutral-200/70"
+                />
+              ))
+            : recentSamples.map((sample) => (
+                <span
+                  key={sample.recordedAt}
+                  className="w-1.5 shrink-0 rounded-full opacity-80"
+                  style={{
+                    height: `${Math.max(sample.value, 8)}%`,
+                    backgroundColor: getMoodLevel(sample.value).color,
+                  }}
+                />
+              ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={chartRef}
-      className={cn(
-        "relative flex w-full touch-pan-y items-end gap-[3px] overflow-hidden px-1 transition-[height] duration-500 ease-[cubic-bezier(.22,1,.36,1)]",
-        expanded ? "h-52" : "h-14",
-      )}
+      className="relative flex h-52 w-full touch-pan-y items-end gap-[3px] overflow-hidden px-1"
       aria-label="情绪值历史图表"
-      onPointerDown={(event) => expanded && selectFromPointer(event.clientX)}
+      onPointerDown={(event) => selectFromPointer(event.clientX)}
       onPointerMove={handlePointerMove}
     >
       {samples.length === 0 ? (
@@ -114,7 +143,7 @@ function EmotionChart({
       ) : (
         samples.map((sample, index) => {
           const mood = getMoodLevel(sample.value);
-          const isSelected = expanded && index === selectedIndex;
+          const isSelected = index === selectedIndex;
 
           return (
             <button
@@ -122,7 +151,7 @@ function EmotionChart({
               type="button"
               className="group relative flex h-full min-w-0 flex-1 items-end justify-center focus-visible:outline-none"
               aria-label={`${formatClock(sample.recordedAt)}，情绪值 ${sample.value}`}
-              onClick={() => expanded && onSelect(index)}
+              onClick={() => onSelect(index)}
             >
               {isSelected && (
                 <span
@@ -296,7 +325,7 @@ export function EmotionMonitor() {
 
   const sheetTransform = expanded
     ? `translate3d(0, ${dragOffset}px, 0)`
-    : `translate3d(0, calc(100% - 158px + ${dragOffset}px), 0)`;
+    : `translate3d(0, calc(100% - 112px + ${dragOffset}px), 0)`;
 
   return (
     <main className="relative mx-auto min-h-[100dvh] w-full max-w-[480px] overflow-hidden bg-[#f7f7f5] text-neutral-950 shadow-[0_0_80px_rgba(0,0,0,0.08)]">
@@ -314,14 +343,14 @@ export function EmotionMonitor() {
       <section
         className={cn(
           "absolute inset-x-0 z-10 flex flex-col items-center transition-[top,transform] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
-          expanded ? "top-[5.75rem]" : "top-[32%] -translate-y-1/2",
+          expanded ? "top-[5.75rem]" : "top-[45%] -translate-y-1/2",
         )}
         aria-live="polite"
       >
         <div
           className={cn(
             "relative grid place-items-center rounded-full transition-[width,height,border-color,box-shadow] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
-            expanded ? "size-20" : "size-[min(67vw,19rem)] border-2",
+            expanded ? "size-20" : "size-[min(67vw,31vh,19rem)] border-2",
           )}
           style={{
             borderColor: expanded ? "transparent" : mood.color,
@@ -349,28 +378,32 @@ export function EmotionMonitor() {
           </div>
         </div>
 
-        <p className={cn("mt-8 text-sm text-neutral-500 transition-all duration-500", expanded ? "-translate-y-3 opacity-0" : "opacity-100")}>
-          {isListening ? mood.hint : "听见情绪，先给自己一点时间"}
-        </p>
-
-        {!isListening && !expanded && (
-          <div className="mt-6 flex flex-col items-center gap-3">
-            <Button size="lg" className="h-12 rounded-full px-6 shadow-[0_12px_30px_rgba(0,0,0,0.12)]" disabled={isStarting} onClick={startListening}>
-              <Mic data-icon="inline-start" />
-              {isStarting ? "正在连接…" : "开始检测"}
-            </Button>
-            <p className="max-w-56 text-center text-[11px] leading-4 text-neutral-400">声音仅在设备上分析，不会保存或上传</p>
-          </div>
-        )}
-
-        {error && !expanded && (
-          <div className="mt-5 max-w-72 rounded-2xl bg-white/80 p-4 text-center shadow-sm ring-1 ring-black/[0.04] backdrop-blur-xl">
-            <MicOff className="mx-auto mb-2 size-4 text-neutral-400" />
-            <p className="text-xs leading-5 text-neutral-500">{error}</p>
-            <Button variant="ghost" size="sm" className="mt-2" onClick={startListening}>再试一次</Button>
-          </div>
+        {isListening && (
+          <p className={cn("absolute top-[calc(100%+2rem)] text-sm text-neutral-500 transition-all duration-500", expanded ? "-translate-y-3 opacity-0" : "opacity-100")}>
+            {mood.hint}
+          </p>
         )}
       </section>
+
+      {!isListening && !expanded && (
+        <div className="absolute inset-x-0 bottom-[calc(112px+1.25rem+env(safe-area-inset-bottom))] z-10 flex flex-col items-center">
+          {error ? (
+            <div className="max-w-72 rounded-2xl bg-white/90 p-4 text-center shadow-sm ring-1 ring-black/[0.04] backdrop-blur-xl">
+              <MicOff className="mx-auto mb-2 size-4 text-neutral-400" />
+              <p className="text-xs leading-5 text-neutral-500">{error}</p>
+              <Button variant="ghost" size="sm" className="mt-2" onClick={startListening}>再试一次</Button>
+            </div>
+          ) : (
+            <>
+              <Button size="lg" className="h-12 rounded-full px-6 shadow-[0_12px_30px_rgba(0,0,0,0.12)]" disabled={isStarting} onClick={startListening}>
+                <Mic data-icon="inline-start" />
+                {isStarting ? "正在连接…" : "开始记录"}
+              </Button>
+              <p className="mt-2 max-w-56 text-center text-[11px] leading-4 text-neutral-400">声音仅在设备上分析，不会保存或上传</p>
+            </>
+          )}
+        </div>
+      )}
 
       <section
         className={cn(
@@ -380,7 +413,7 @@ export function EmotionMonitor() {
         style={{ transform: sheetTransform }}
       >
         <div
-          className="touch-none select-none pt-3"
+          className="touch-none select-none rounded-t-[2.25rem] pt-3 focus-visible:outline-none"
           role="button"
           tabIndex={0}
           aria-label={expanded ? "收起情绪记录" : "展开情绪记录"}
@@ -401,28 +434,38 @@ export function EmotionMonitor() {
           }}
         >
           <div className="mx-auto h-1.5 w-11 rounded-full bg-neutral-200" />
-          <div className="mt-3 flex items-start justify-between gap-5">
-            <div>
-              <p className="text-[11px] font-medium tracking-[0.08em] text-neutral-400">{expanded ? "情绪轨迹" : "最近变化"}</p>
-              <p className={cn("mt-1 font-semibold tracking-tight transition-all", expanded ? "text-xl" : "text-sm")}>
-                {expanded ? "刚才，到现在" : isListening ? "持续记录中" : "等待检测"}
+          {expanded ? (
+            <div className="mt-4 flex items-end justify-between gap-5">
+              <p className="text-xl font-semibold tracking-tight">刚才，到现在</p>
+              <p className="text-xl font-medium tabular-nums">{formatDuration(elapsedSeconds)}</p>
+            </div>
+          ) : (
+            <div className="mt-2 flex h-16 items-center gap-6">
+              <div className="min-w-0 flex-1">
+                <EmotionChart
+                  samples={samples}
+                  selectedIndex={null}
+                  expanded={false}
+                  onSelect={setSelectedIndex}
+                />
+              </div>
+              <p className="shrink-0 text-2xl font-medium tabular-nums tracking-[-0.03em]">
+                {formatDuration(elapsedSeconds)}
               </p>
             </div>
-            <div className="text-right">
-              <p className="text-[11px] font-medium tracking-[0.08em] text-neutral-400">持续时间</p>
-              <p className={cn("mt-1 font-medium tabular-nums transition-all", expanded ? "text-xl" : "text-sm")}>{formatDuration(elapsedSeconds)}</p>
-            </div>
-          </div>
+          )}
         </div>
 
-        <div className={cn("transition-[margin] duration-500", expanded ? "mt-8" : "mt-2")}>
-          <EmotionChart
-            samples={samples}
-            selectedIndex={selectedIndex ?? Math.max(samples.length - 1, 0)}
-            expanded={expanded}
-            onSelect={setSelectedIndex}
-          />
-        </div>
+        {expanded && (
+          <div className="mt-8">
+            <EmotionChart
+              samples={samples}
+              selectedIndex={selectedIndex ?? Math.max(samples.length - 1, 0)}
+              expanded
+              onSelect={setSelectedIndex}
+            />
+          </div>
+        )}
 
         <div className={cn("grid overflow-hidden transition-[grid-template-rows,opacity,transform] duration-500", expanded ? "mt-8 grid-rows-[1fr] translate-y-0 opacity-100" : "grid-rows-[0fr] translate-y-5 opacity-0")}>
           <div className="min-h-0 text-center">
