@@ -7,11 +7,14 @@ import { ArrowLeft, Check, Pause, Play } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
-  DEFAULT_REMINDER_AUDIO_ID,
+  DEFAULT_REMINDER_OPTION_ID,
   getReminderAudio,
+  getReminderOptionId,
+  RECENT_AUDIO_REPLAY_ID,
   REMINDER_AUDIO_OPTIONS,
   REMINDER_AUDIO_STORAGE_KEY,
   type ReminderAudioId,
+  type ReminderOptionId,
 } from "@/lib/reminder-audio";
 
 const REMINDER_AUDIO_CHANGE_EVENT = "huan-yi-huan-reminder-audio-change";
@@ -25,11 +28,11 @@ function subscribeToReminderAudio(onStoreChange: () => void) {
   };
 }
 
-function getStoredReminderAudio(): ReminderAudioId {
+function getStoredReminderOption(): ReminderOptionId {
   try {
-    return getReminderAudio(window.localStorage.getItem(REMINDER_AUDIO_STORAGE_KEY)).id;
+    return getReminderOptionId(window.localStorage.getItem(REMINDER_AUDIO_STORAGE_KEY));
   } catch {
-    return DEFAULT_REMINDER_AUDIO_ID;
+    return DEFAULT_REMINDER_OPTION_ID;
   }
 }
 
@@ -38,8 +41,8 @@ export function AudioSettings() {
   const previewRef = useRef<HTMLAudioElement | null>(null);
   const selectedId = useSyncExternalStore(
     subscribeToReminderAudio,
-    getStoredReminderAudio,
-    () => DEFAULT_REMINDER_AUDIO_ID,
+    getStoredReminderOption,
+    () => DEFAULT_REMINDER_OPTION_ID,
   );
 
   useEffect(() => {
@@ -49,7 +52,10 @@ export function AudioSettings() {
     };
   }, []);
 
-  const chooseAudio = (id: ReminderAudioId) => {
+  const chooseReminder = (id: ReminderOptionId) => {
+    previewRef.current?.pause();
+    previewRef.current = null;
+    setPlayingId(null);
     window.localStorage.setItem(REMINDER_AUDIO_STORAGE_KEY, id);
     window.dispatchEvent(new Event(REMINDER_AUDIO_CHANGE_EVENT));
   };
@@ -98,14 +104,49 @@ export function AudioSettings() {
       </header>
 
       <section className="mt-16">
-        <p className="text-xs font-medium tracking-[0.12em] text-neutral-400">REMINDER SOUND</p>
-        <h1 className="mt-3 text-3xl font-semibold tracking-[-0.045em]">选择提醒声音</h1>
+        <p className="text-xs font-medium tracking-[0.12em] text-neutral-400">REMINDER</p>
+        <h1 className="mt-3 text-3xl font-semibold tracking-[-0.045em]">选择提醒方式</h1>
         <p className="mt-3 max-w-sm text-sm leading-6 text-neutral-500">
-          当情绪值进入红色区间时，用一个熟悉的声音提醒你先停一下。
+          情绪升高时，只使用你选中的一种方式提醒你先停一下。
         </p>
       </section>
 
-      <section className="mt-10 space-y-3" aria-label="提醒声音列表">
+      <section className="mt-10 space-y-3" aria-label="提醒方式列表">
+        <article
+          className={cn(
+            "flex items-center gap-4 rounded-[1.75rem] bg-white p-3 pl-5 shadow-sm ring-1 transition-all",
+            selectedId === RECENT_AUDIO_REPLAY_ID ? "ring-neutral-950/15" : "ring-black/[0.04]",
+          )}
+        >
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-center gap-4 py-2 text-left focus-visible:outline-none"
+            aria-pressed={selectedId === RECENT_AUDIO_REPLAY_ID}
+            onClick={() => chooseReminder(RECENT_AUDIO_REPLAY_ID)}
+          >
+            <span
+              className={cn(
+                "grid size-6 shrink-0 place-items-center rounded-full border transition-colors",
+                selectedId === RECENT_AUDIO_REPLAY_ID
+                  ? "border-neutral-950 bg-neutral-950 text-white"
+                  : "border-neutral-200",
+              )}
+            >
+              {selectedId === RECENT_AUDIO_REPLAY_ID && (
+                <Check className="size-3.5" strokeWidth={2.5} />
+              )}
+            </span>
+            <span className="min-w-0">
+              <span className="block font-medium tracking-tight">回放刚才 8 秒</span>
+              <span className="mt-0.5 block text-xs text-neutral-400">只在本机内存中滚动保留</span>
+            </span>
+          </button>
+
+          <span className="grid h-11 min-w-14 place-items-center rounded-full bg-neutral-100 px-3 text-xs font-medium text-neutral-500">
+            默认
+          </span>
+        </article>
+
         {REMINDER_AUDIO_OPTIONS.map((option) => {
           const selected = option.id === selectedId;
           const playing = option.id === playingId;
@@ -122,7 +163,7 @@ export function AudioSettings() {
                 type="button"
                 className="flex min-w-0 flex-1 items-center gap-4 py-2 text-left focus-visible:outline-none"
                 aria-pressed={selected}
-                onClick={() => chooseAudio(option.id)}
+                onClick={() => chooseReminder(option.id)}
               >
                 <span
                   className={cn(
@@ -154,7 +195,7 @@ export function AudioSettings() {
       </section>
 
       <p className="mt-8 text-center text-xs leading-5 text-neutral-400">
-        默认使用“消防车”。选择只保存在当前设备。
+        默认回放刚才 8 秒。四种方式不会同时播放，选择只保存在当前设备。
       </p>
     </main>
   );

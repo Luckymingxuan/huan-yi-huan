@@ -12,7 +12,13 @@ import Link from "next/link";
 import { MicOff, Pause, Play, Settings2 } from "lucide-react";
 
 import { Button, buttonVariants } from "@/components/ui/button";
-import { getReminderAudio, REMINDER_AUDIO_STORAGE_KEY } from "@/lib/reminder-audio";
+import {
+  getReminderAudio,
+  getReminderOptionId,
+  RECENT_AUDIO_REPLAY_ID,
+  REMINDER_AUDIO_STORAGE_KEY,
+  type ReminderOptionId,
+} from "@/lib/reminder-audio";
 import { cn } from "@/lib/utils";
 
 type Sample = { value: number; recordedAt: number; elapsedSeconds: number };
@@ -23,14 +29,23 @@ type EmotionMessage = {
   mode?: string;
   probs?: number[];
 };
+type RollingPcmBuffer = {
+  samples: Int16Array;
+  writeIndex: number;
+  length: number;
+};
 
 const DEFAULT_COLLAPSED_SAMPLE_LIMIT = 22;
 const COLLAPSED_BAR_STEP = 12;
 const AUTO_FOLLOW_RESUME_DISTANCE = 4;
 const TARGET_SAMPLE_RATE = 16_000;
+const RECENT_AUDIO_SECONDS = 8;
+const RECENT_AUDIO_SAMPLE_CAPACITY = TARGET_SAMPLE_RATE * RECENT_AUDIO_SECONDS;
+const REPLAY_CAPTURE_TAIL_MS = 2_500;
+const REPLAY_FEEDBACK_GUARD_MS = 250;
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
-const ALARM_TRIGGER_VALUE = 52;
-const ALARM_REARM_VALUE = 46;
+const ALARM_TRIGGER_VALUE = 45;
+const ALARM_REARM_VALUE = 39;
 const FASTAPI_HOST = process.env.NEXT_PUBLIC_FASTAPI_HOST?.trim() || "127.0.0.1";
 const FASTAPI_PORT = process.env.NEXT_PUBLIC_FASTAPI_PORT?.trim() || "8000";
 
@@ -74,6 +89,54 @@ function resampleToPcm16(input: Float32Array, sourceSampleRate: number) {
   }
 
   return output;
+}
+
+function createRollingPcmBuffer(): RollingPcmBuffer {
+  return {
+    samples: new Int16Array(RECENT_AUDIO_SAMPLE_CAPACITY),
+    writeIndex: 0,
+    length: 0,
+  };
+}
+
+function appendRollingPcm(buffer: RollingPcmBuffer, chunk: Int16Array) {
+  const capacity = buffer.samples.length;
+  if (chunk.length >= capacity) {
+    buffer.samples.set(chunk.subarray(chunk.length - capacity));
+    buffer.writeIndex = 0;
+    buffer.length = capacity;
+    return;
+  }
+
+  const firstPartLength = Math.min(chunk.length, capacity - buffer.writeIndex);
+  buffer.samples.set(chunk.subarray(0, firstPartLength), buffer.writeIndex);
+  const secondPartLength = chunk.length - firstPartLength;
+  if (secondPartLength > 0) {
+    buffer.samples.set(chunk.subarray(firstPartLength), 0);
+  }
+
+  buffer.writeIndex = (buffer.writeIndex + chunk.length) % capacity;
+  buffer.length = Math.min(capacity, buffer.length + chunk.length);
+}
+
+function snapshotRollingPcm(buffer: RollingPcmBuffer) {
+  const snapshot = new Int16Array(buffer.length);
+  if (buffer.length === 0) return snapshot;
+
+  const capacity = buffer.samples.length;
+  const startIndex = (buffer.writeIndex - buffer.length + capacity) % capacity;
+  const firstPartLength = Math.min(buffer.length, capacity - startIndex);
+  snapshot.set(buffer.samples.subarray(startIndex, startIndex + firstPartLength));
+  if (firstPartLength < buffer.length) {
+    snapshot.set(buffer.samples.subarray(0, buffer.length - firstPartLength), firstPartLength);
+  }
+  return snapshot;
+}
+
+function clearRollingPcm(buffer: RollingPcmBuffer) {
+  buffer.samples.fill(0);
+  buffer.writeIndex = 0;
+  buffer.length = 0;
 }
 
 function getMoodLevel(value: number): MoodLevel {
@@ -478,6 +541,8 @@ export function EmotionMonitor() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [isReplayPending, setIsReplayPending] = useState(false);
+  const [isReplaying, setIsReplaying] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -498,6 +563,12 @@ export function EmotionMonitor() {
   const canSendAudioRef = useRef(false);
   const emotionLabelsRef = useRef<string[]>([]);
   const reminderAudioRef = useRef<HTMLAudioElement | null>(null);
+  const reminderOptionRef = useRef<ReminderOptionId>(RECENT_AUDIO_REPLAY_ID);
+  const rollingAudioRef = useRef<RollingPcmBuffer>(createRollingPcmBuffer());
+  const replaySourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const replayStartTimerRef = useRef<number | null>(null);
+  const replayResumeTimerRef = useRef<number | null>(null);
+  const isReplayingRef = useRef(false);
   const highEmotionRef = useRef(false);
   const lastReminderAtRef = useRef(0);
 
@@ -507,11 +578,38 @@ export function EmotionMonitor() {
     return samples[selectedIndex ?? samples.length - 1] ?? samples[samples.length - 1];
   }, [samples, selectedIndex]);
 
+  const stopActiveReplay = useCallback(() => {
+    if (replayStartTimerRef.current !== null) {
+      clearTimeout(replayStartTimerRef.current);
+      replayStartTimerRef.current = null;
+    }
+    if (replayResumeTimerRef.current !== null) {
+      clearTimeout(replayResumeTimerRef.current);
+      replayResumeTimerRef.current = null;
+    }
+    const replaySource = replaySourceRef.current;
+    replaySourceRef.current = null;
+    if (replaySource) {
+      replaySource.onended = null;
+      try {
+        replaySource.stop();
+      } catch {
+        // The source may already have ended.
+      }
+      replaySource.disconnect();
+    }
+    isReplayingRef.current = false;
+    setIsReplayPending(false);
+    setIsReplaying(false);
+    clearRollingPcm(rollingAudioRef.current);
+  }, []);
+
   const stopListening = useCallback(() => {
     if (elapsedTimerRef.current !== null) {
       clearInterval(elapsedTimerRef.current);
       elapsedTimerRef.current = null;
     }
+    stopActiveReplay();
     canSendAudioRef.current = false;
     emotionLabelsRef.current = [];
     const websocket = websocketRef.current;
@@ -541,28 +639,99 @@ export function EmotionMonitor() {
     reminderAudioRef.current?.pause();
     if (reminderAudioRef.current) reminderAudioRef.current.currentTime = 0;
     reminderAudioRef.current = null;
+    reminderOptionRef.current = RECENT_AUDIO_REPLAY_ID;
     highEmotionRef.current = false;
     isPausedRef.current = false;
     setIsPaused(false);
     setIsListening(false);
-  }, []);
+  }, [stopActiveReplay]);
 
   useEffect(() => stopListening, [stopListening]);
 
+  const replayRecentAudio = useCallback(() => {
+    const audioContext = audioContextRef.current;
+    if (!audioContext || audioContext.state === "closed") return false;
+
+    const pcm = snapshotRollingPcm(rollingAudioRef.current);
+    if (pcm.length === 0) return false;
+    clearRollingPcm(rollingAudioRef.current);
+
+    const audioBuffer = audioContext.createBuffer(1, pcm.length, TARGET_SAMPLE_RATE);
+    const channelData = audioBuffer.getChannelData(0);
+    for (let index = 0; index < pcm.length; index += 1) {
+      channelData[index] = pcm[index] / 32768;
+    }
+
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioContext.destination);
+    replaySourceRef.current = source;
+    isReplayingRef.current = true;
+    setIsReplaying(true);
+
+    const websocket = websocketRef.current;
+    if (websocket?.readyState === WebSocket.OPEN) {
+      websocket.send(JSON.stringify({ type: "reset" }));
+    }
+
+    source.onended = () => {
+      if (replaySourceRef.current !== source) return;
+      replaySourceRef.current = null;
+      source.disconnect();
+      replayResumeTimerRef.current = window.setTimeout(() => {
+        replayResumeTimerRef.current = null;
+        isReplayingRef.current = false;
+        setIsReplaying(false);
+        const activeWebsocket = websocketRef.current;
+        if (activeWebsocket?.readyState === WebSocket.OPEN) {
+          activeWebsocket.send(JSON.stringify({ type: "reset" }));
+        }
+      }, REPLAY_FEEDBACK_GUARD_MS);
+    };
+    source.start();
+    return true;
+  }, []);
+
+  const scheduleRecentAudioReplay = useCallback(() => {
+    if (
+      replayStartTimerRef.current !== null ||
+      isReplayingRef.current ||
+      rollingAudioRef.current.length === 0
+    ) {
+      return false;
+    }
+
+    setIsReplayPending(true);
+    replayStartTimerRef.current = window.setTimeout(() => {
+      replayStartTimerRef.current = null;
+      setIsReplayPending(false);
+      replayRecentAudio();
+    }, REPLAY_CAPTURE_TAIL_MS);
+    return true;
+  }, [replayRecentAudio]);
+
   const applyEmotionResult = useCallback((probs: number[]) => {
-    if (isPausedRef.current) return;
+    if (isPausedRef.current || isReplayingRef.current) return;
     const nextValue = getNegativeEmotionValue(probs, emotionLabelsRef.current);
     if (nextValue === null) return;
 
     if (nextValue >= ALARM_TRIGGER_VALUE) {
       const now = Date.now();
       if (!highEmotionRef.current && now - lastReminderAtRef.current >= 10_000) {
-        const reminderAudio = reminderAudioRef.current;
-        if (reminderAudio) {
-          reminderAudio.currentTime = 0;
-          void reminderAudio.play().catch(() => undefined);
+        let reminderStarted = false;
+        if (reminderOptionRef.current === RECENT_AUDIO_REPLAY_ID) {
+          reminderStarted = scheduleRecentAudioReplay();
+        } else {
+          const reminderAudio = reminderAudioRef.current;
+          if (reminderAudio) {
+            reminderAudio.currentTime = 0;
+            void reminderAudio.play().catch(() => undefined);
+            reminderStarted = true;
+          }
         }
-        lastReminderAtRef.current = now;
+        if (reminderStarted) {
+          lastReminderAtRef.current = now;
+        }
       }
       highEmotionRef.current = true;
     } else if (nextValue < ALARM_REARM_VALUE) {
@@ -575,7 +744,7 @@ export function EmotionMonitor() {
       ...current,
       { value: nextValue, recordedAt, elapsedSeconds: elapsedSecondsRef.current },
     ]);
-  }, []);
+  }, [scheduleRecentAudioReplay]);
 
   const startListening = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -593,18 +762,25 @@ export function EmotionMonitor() {
       } catch {
         // Storage can be unavailable in restrictive browser modes; use the default.
       }
-      const reminder = getReminderAudio(savedReminderId);
-      const reminderAudio = new Audio(reminder.src);
-      reminderAudio.preload = "auto";
-      reminderAudio.volume = 0;
-      reminderAudioRef.current = reminderAudio;
-      void reminderAudio.play().then(() => {
-        reminderAudio.pause();
-        reminderAudio.currentTime = 0;
-        reminderAudio.volume = 1;
-      }).catch(() => {
-        reminderAudio.volume = 1;
-      });
+      const reminderOption = getReminderOptionId(savedReminderId);
+      reminderOptionRef.current = reminderOption;
+      clearRollingPcm(rollingAudioRef.current);
+      if (reminderOption !== RECENT_AUDIO_REPLAY_ID) {
+        const reminder = getReminderAudio(reminderOption);
+        const reminderAudio = new Audio(reminder.src);
+        reminderAudio.preload = "auto";
+        reminderAudio.volume = 0;
+        reminderAudioRef.current = reminderAudio;
+        void reminderAudio.play().then(() => {
+          reminderAudio.pause();
+          reminderAudio.currentTime = 0;
+          reminderAudio.volume = 1;
+        }).catch(() => {
+          reminderAudio.volume = 1;
+        });
+      } else {
+        reminderAudioRef.current = null;
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -625,7 +801,10 @@ export function EmotionMonitor() {
       setElapsedSeconds(0);
       elapsedSecondsRef.current = 0;
       isPausedRef.current = false;
+      isReplayingRef.current = false;
       setIsPaused(false);
+      setIsReplayPending(false);
+      setIsReplaying(false);
 
       const websocket = await new Promise<WebSocket>((resolve, reject) => {
         const socket = new WebSocket(getEmotionWebSocketUrl());
@@ -706,17 +885,20 @@ export function EmotionMonitor() {
       processorRef.current = processor;
       silentGainRef.current = silentGain;
       processor.onaudioprocess = (event) => {
+        if (isPausedRef.current || isReplayingRef.current) return;
+
+        const input = event.inputBuffer.getChannelData(0);
+        const pcm = resampleToPcm16(input, audioContext.sampleRate);
+        if (reminderOptionRef.current === RECENT_AUDIO_REPLAY_ID) {
+          appendRollingPcm(rollingAudioRef.current, pcm);
+        }
         if (
-          isPausedRef.current ||
           !canSendAudioRef.current ||
           websocket.readyState !== WebSocket.OPEN ||
           websocket.bufferedAmount > MAX_WEBSOCKET_BUFFER
         ) {
           return;
         }
-
-        const input = event.inputBuffer.getChannelData(0);
-        const pcm = resampleToPcm16(input, audioContext.sampleRate);
         websocket.send(pcm.buffer);
       };
 
@@ -762,6 +944,7 @@ export function EmotionMonitor() {
 
     isPausedRef.current = true;
     setIsPaused(true);
+    stopActiveReplay();
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
       websocketRef.current.send(JSON.stringify({ type: "reset" }));
     }
@@ -860,7 +1043,13 @@ export function EmotionMonitor() {
 
         {isListening && (
           <p className={cn("absolute top-[calc(100%+2rem)] text-sm text-neutral-500 transition-all duration-500", expanded ? "-translate-y-3 opacity-0" : "opacity-100")}>
-            {isPaused ? "记录已暂停" : mood.hint}
+            {isPaused
+              ? "记录已暂停"
+              : isReplayPending
+                ? "稍等，让这句话说完"
+                : isReplaying
+                  ? "听一听刚才的声音"
+                  : mood.hint}
           </p>
         )}
       </section>
