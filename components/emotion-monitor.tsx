@@ -7,6 +7,8 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import Link from "next/link";
 import { MicOff, Pause, Play, Settings2 } from "lucide-react";
@@ -39,6 +41,15 @@ import {
 import { cn } from "@/lib/utils";
 
 type Sample = { value: number; recordedAt: number; elapsedSeconds: number };
+type SheetStage = "collapsed" | "overview" | "transcript";
+type SheetMouseDrag = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  mode: "pending" | "horizontal" | "vertical";
+  transcriptList: HTMLElement | null;
+  transcriptScrollTop: number;
+};
 type MoodLevel = { label: string; hint: string; color: string; softColor: string };
 type EmotionMessage = {
   type?: string;
@@ -619,7 +630,7 @@ export function EmotionMonitor() {
   const [isReplaying, setIsReplaying] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState(false);
+  const [sheetStage, setSheetStage] = useState<SheetStage>("collapsed");
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [dragOffset, setDragOffset] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
@@ -633,7 +644,12 @@ export function EmotionMonitor() {
   const transcriptWebsocketRef = useRef<WebSocket | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedSecondsRef = useRef(0);
+  const sheetRef = useRef<HTMLElement | null>(null);
   const dragStartYRef = useRef<number | null>(null);
+  const sheetMouseDragRef = useRef<SheetMouseDrag | null>(null);
+  const sheetTouchStartYRef = useRef<number | null>(null);
+  const wheelGestureConsumedRef = useRef(false);
+  const wheelGestureIdleTimerRef = useRef<number | null>(null);
   const isPausedRef = useRef(false);
   const canSendAudioRef = useRef(false);
   const canSendTranscriptAudioRef = useRef(false);
@@ -661,11 +677,21 @@ export function EmotionMonitor() {
   const lastReminderAtRef = useRef(0);
   const alarmThresholdsRef = useRef(getAlarmThresholds(DEFAULT_ALARM_SENSITIVITY));
 
+  const expanded = sheetStage !== "collapsed";
+  const isTranscriptStage = sheetStage === "transcript";
   const mood = getMoodLevel(emotionValue);
   const selectedSample = useMemo(() => {
     if (samples.length === 0) return null;
     return samples[selectedIndex ?? samples.length - 1] ?? samples[samples.length - 1];
   }, [samples, selectedIndex]);
+
+  useEffect(() => {
+    return () => {
+      if (wheelGestureIdleTimerRef.current !== null) {
+        clearTimeout(wheelGestureIdleTimerRef.current);
+      }
+    };
+  }, []);
 
   const stopActiveReplay = useCallback(() => {
     replayRequestIdRef.current += 1;
@@ -1304,6 +1330,155 @@ export function EmotionMonitor() {
     }
   };
 
+  const advanceSheetStage = () => {
+    setSheetStage((current) => {
+      if (current === "collapsed") return "overview";
+      if (current === "overview") return "transcript";
+      return current;
+    });
+  };
+
+  const retreatSheetStage = () => {
+    setSheetStage((current) => {
+      if (current === "transcript") return "overview";
+      if (current === "overview") return "collapsed";
+      return current;
+    });
+  };
+
+  const handleSheetWheel = (event: ReactWheelEvent<HTMLElement>) => {
+    if (wheelGestureIdleTimerRef.current !== null) {
+      clearTimeout(wheelGestureIdleTimerRef.current);
+    }
+    wheelGestureIdleTimerRef.current = window.setTimeout(() => {
+      wheelGestureIdleTimerRef.current = null;
+      wheelGestureConsumedRef.current = false;
+    }, 180);
+
+    if (wheelGestureConsumedRef.current) {
+      event.preventDefault();
+      return;
+    }
+
+    if (event.deltaY > 10 && sheetStage !== "transcript") {
+      event.preventDefault();
+      wheelGestureConsumedRef.current = true;
+      advanceSheetStage();
+      return;
+    }
+
+    if (
+      event.deltaY < -10 &&
+      (sheetStage === "overview" ||
+        (sheetStage === "transcript" &&
+          event.currentTarget.scrollTop <= 2 &&
+          !(
+            event.target instanceof Element &&
+            event.target.closest<HTMLElement>("[data-transcript-list]")?.scrollTop
+          )))
+    ) {
+      event.preventDefault();
+      wheelGestureConsumedRef.current = true;
+      retreatSheetStage();
+    }
+  };
+
+  const handleSheetTouchStart = (event: ReactTouchEvent<HTMLElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const transcriptList = target?.closest<HTMLElement>("[data-transcript-list]") ?? null;
+    if (target?.closest("[data-sheet-handle]")) {
+      sheetTouchStartYRef.current = null;
+      return;
+    }
+    if (sheetStage === "transcript" && transcriptList && transcriptList.scrollTop > 0) {
+      sheetTouchStartYRef.current = null;
+      return;
+    }
+    sheetTouchStartYRef.current = event.touches[0]?.clientY ?? null;
+  };
+
+  const handleSheetTouchEnd = (event: ReactTouchEvent<HTMLElement>) => {
+    const startY = sheetTouchStartYRef.current;
+    sheetTouchStartYRef.current = null;
+    const endY = event.changedTouches[0]?.clientY;
+    if (startY === null || endY === undefined) return;
+
+    const delta = endY - startY;
+    if (delta < -48) advanceSheetStage();
+    else if (delta > 48) retreatSheetStage();
+  };
+
+  const handleSheetMousePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType !== "mouse" || event.button !== 0) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest("[data-sheet-handle]")) return;
+
+    const transcriptList = target?.closest<HTMLElement>("[data-transcript-list]") ?? null;
+    sheetMouseDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      mode: "pending",
+      transcriptList,
+      transcriptScrollTop: transcriptList?.scrollTop ?? 0,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleSheetMousePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = sheetMouseDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
+
+    if (drag.mode === "pending") {
+      if (Math.max(Math.abs(deltaX), Math.abs(deltaY)) < 7) return;
+      drag.mode = Math.abs(deltaY) > Math.abs(deltaX) + 4 ? "vertical" : "horizontal";
+    }
+    if (drag.mode !== "vertical") return;
+
+    event.preventDefault();
+    setIsDragging(true);
+    if (sheetStage === "transcript" && drag.transcriptList) {
+      drag.transcriptList.scrollTop = Math.max(0, drag.transcriptScrollTop - deltaY);
+      const unconsumedDownwardDrag = Math.max(0, deltaY - drag.transcriptScrollTop);
+      setDragOffset(clamp(unconsumedDownwardDrag, 0, 240));
+      return;
+    }
+
+    if (sheetStage === "collapsed") setDragOffset(clamp(deltaY, -240, 0));
+    else if (sheetStage === "overview") setDragOffset(clamp(deltaY, -180, 240));
+    else setDragOffset(clamp(deltaY, 0, 240));
+  };
+
+  const finishSheetMouseDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = sheetMouseDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    sheetMouseDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (drag.mode === "vertical") {
+      const deltaY = event.clientY - drag.startY;
+      const stageDeltaY = sheetStage === "transcript" && drag.transcriptList
+        ? deltaY - drag.transcriptScrollTop
+        : deltaY;
+      if (stageDeltaY < -48) advanceSheetStage();
+      else if (stageDeltaY > 48) retreatSheetStage();
+    }
+    setDragOffset(0);
+    setIsDragging(false);
+  };
+
+  const cancelSheetMouseDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = sheetMouseDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    sheetMouseDragRef.current = null;
+    setDragOffset(0);
+    setIsDragging(false);
+  };
+
   const handleSheetPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     dragStartYRef.current = event.clientY;
     setIsDragging(true);
@@ -1313,15 +1488,25 @@ export function EmotionMonitor() {
   const handleSheetPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (dragStartYRef.current === null) return;
     const delta = event.clientY - dragStartYRef.current;
-    setDragOffset(expanded ? clamp(delta, 0, 240) : clamp(delta, -240, 0));
+    if (sheetStage === "collapsed") setDragOffset(clamp(delta, -240, 0));
+    else if (sheetStage === "overview") setDragOffset(clamp(delta, -180, 240));
+    else setDragOffset(clamp(delta, 0, 240));
   };
 
   const handleSheetPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (dragStartYRef.current === null) return;
     const delta = event.clientY - dragStartYRef.current;
-    if (Math.abs(delta) < 8) setExpanded((current) => !current);
-    else if (delta < -48) setExpanded(true);
-    else if (delta > 48) setExpanded(false);
+    if (Math.abs(delta) < 8) {
+      setSheetStage((current) => {
+        if (current === "collapsed") return "overview";
+        if (current === "transcript") return "overview";
+        return "collapsed";
+      });
+    } else if (delta < -48) {
+      advanceSheetStage();
+    } else if (delta > 48) {
+      retreatSheetStage();
+    }
     dragStartYRef.current = null;
     setDragOffset(0);
     setIsDragging(false);
@@ -1442,17 +1627,36 @@ export function EmotionMonitor() {
       )}
 
       <section
+        ref={sheetRef}
         className={cn(
-          "absolute inset-x-0 top-[10.75rem] z-20 flex min-h-[calc(100dvh-10.75rem)] flex-col overflow-y-auto overscroll-contain rounded-t-[2.25rem] bg-white/94 px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] shadow-[0_-18px_60px_rgba(0,0,0,0.08)] backdrop-blur-2xl",
-          !isDragging && "transition-transform duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
+          "absolute inset-x-0 bottom-0 z-20 flex flex-col overscroll-contain rounded-t-[2.25rem] bg-white/94 px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] shadow-[0_-18px_60px_rgba(0,0,0,0.08)] backdrop-blur-2xl",
+          isTranscriptStage ? "top-[4.75rem] overflow-y-auto" : "top-[10.75rem] overflow-hidden",
+          !isDragging && "transition-[top,transform] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
         )}
         style={{ transform: sheetTransform }}
+        onWheel={handleSheetWheel}
+        onTouchStart={handleSheetTouchStart}
+        onTouchEnd={handleSheetTouchEnd}
+        onPointerDownCapture={handleSheetMousePointerDown}
+        onPointerMoveCapture={handleSheetMousePointerMove}
+        onPointerUpCapture={finishSheetMouseDrag}
+        onPointerCancelCapture={cancelSheetMouseDrag}
       >
         <div
-          className="touch-none select-none rounded-t-[2.25rem] pt-3 focus-visible:outline-none"
+          data-sheet-handle
+          className={cn(
+            "touch-none select-none rounded-t-[2.25rem] pt-3 focus-visible:outline-none",
+            isTranscriptStage && "sticky top-0 z-20 -mx-5 bg-white/94 px-5 pb-3 backdrop-blur-2xl",
+          )}
           role="button"
           tabIndex={0}
-          aria-label={expanded ? "收起情绪记录" : "展开情绪记录"}
+          aria-label={
+            sheetStage === "collapsed"
+              ? "展开情绪记录"
+              : isTranscriptStage
+                ? "返回情绪概览"
+                : "收起情绪记录"
+          }
           aria-expanded={expanded}
           onPointerDown={handleSheetPointerDown}
           onPointerMove={handleSheetPointerMove}
@@ -1463,9 +1667,19 @@ export function EmotionMonitor() {
             setIsDragging(false);
           }}
           onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
+            if (event.key === "ArrowUp") {
               event.preventDefault();
-              setExpanded((current) => !current);
+              advanceSheetStage();
+            } else if (event.key === "ArrowDown") {
+              event.preventDefault();
+              retreatSheetStage();
+            } else if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setSheetStage((current) => {
+                if (current === "collapsed") return "overview";
+                if (current === "transcript") return "overview";
+                return "collapsed";
+              });
             }
           }}
         >
@@ -1503,29 +1717,58 @@ export function EmotionMonitor() {
         </div>
 
         {expanded && (
-          <div className="mt-8">
-            <EmotionChart
-              samples={samples}
-              selectedIndex={selectedIndex ?? Math.max(samples.length - 1, 0)}
-              expanded
-              onSelect={setSelectedIndex}
-            />
+          <div
+            className={cn(
+              "grid transition-[grid-template-rows,margin,opacity,transform] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
+              isTranscriptStage
+                ? "mt-0 grid-rows-[0fr] -translate-y-5 opacity-0"
+                : "mt-8 grid-rows-[1fr] translate-y-0 opacity-100",
+            )}
+          >
+            <div className="min-h-0 overflow-hidden">
+              <EmotionChart
+                samples={samples}
+                selectedIndex={selectedIndex ?? Math.max(samples.length - 1, 0)}
+                expanded
+                onSelect={setSelectedIndex}
+              />
+            </div>
           </div>
         )}
 
-        <div className={cn("grid overflow-hidden transition-[grid-template-rows,opacity,transform] duration-500", expanded ? "mt-8 grid-rows-[1fr] translate-y-0 opacity-100" : "grid-rows-[0fr] translate-y-5 opacity-0")}>
+        <div className={cn(
+          "grid overflow-hidden transition-[grid-template-rows,margin,opacity,transform] duration-500",
+          expanded
+            ? cn(
+                "grid-rows-[1fr] translate-y-0 opacity-100",
+                isTranscriptStage ? "mt-0" : "mt-8",
+              )
+            : "grid-rows-[0fr] translate-y-5 opacity-0",
+        )}>
           <div className="min-h-0 text-center">
-            <p className="text-xs font-medium tracking-[0.08em] text-neutral-400">{selectedIndex === null ? "当前" : "所选时刻"}</p>
-            <div className="mt-3 flex items-baseline justify-center gap-2">
-              <span className="text-4xl font-semibold tabular-nums tracking-[-0.06em]">{selectedSample?.value ?? 0}</span>
-              <span className="text-sm text-neutral-400">情绪值</span>
+            <div
+              className={cn(
+                "grid transition-[grid-template-rows,opacity,transform] duration-500 ease-[cubic-bezier(.22,1,.36,1)]",
+                isTranscriptStage
+                  ? "grid-rows-[0fr] -translate-y-4 opacity-0"
+                  : "grid-rows-[1fr] translate-y-0 opacity-100",
+              )}
+            >
+              <div className="min-h-0 overflow-hidden">
+                <p className="text-xs font-medium tracking-[0.08em] text-neutral-400">{selectedIndex === null ? "当前" : "所选时刻"}</p>
+                <div className="mt-3 flex items-baseline justify-center gap-2">
+                  <span className="text-4xl font-semibold tabular-nums tracking-[-0.06em]">{selectedSample?.value ?? 0}</span>
+                  <span className="text-sm text-neutral-400">情绪值</span>
+                </div>
+                <p className="mt-2 text-sm tabular-nums text-neutral-400">{selectedSample ? formatClock(selectedSample.recordedAt) : "等待第一条记录"}</p>
+              </div>
             </div>
-            <p className="mt-2 text-sm tabular-nums text-neutral-400">{selectedSample ? formatClock(selectedSample.recordedAt) : "等待第一条记录"}</p>
             <ConversationTranscript
               entries={transcriptEntries}
               targetSeconds={selectedSample?.elapsedSeconds ?? null}
               isListening={isListening}
               isPaused={isPaused}
+              immersive={isTranscriptStage}
             />
           </div>
         </div>

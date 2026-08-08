@@ -41,11 +41,13 @@ export function ConversationTranscript({
   targetSeconds,
   isListening,
   isPaused,
+  immersive = false,
 }: {
   entries: TranscriptEntry[];
   targetSeconds: number | null;
   isListening: boolean;
   isPaused: boolean;
+  immersive?: boolean;
 }) {
   const focusedEntryIndex = useMemo(
     () => findFocusedEntryIndex(entries, targetSeconds),
@@ -93,7 +95,11 @@ export function ConversationTranscript({
       ) : (
         <div
           ref={transcriptListRef}
-          className="mt-4 max-h-[17rem] overflow-y-auto overscroll-contain px-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          data-transcript-list
+          className={cn(
+            "mt-4 overflow-y-auto overscroll-contain px-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+            immersive ? "max-h-[calc(100dvh-18rem)] min-h-48" : "max-h-[17rem]",
+          )}
         >
           {entries.map((entry, index) => {
             const isFocused = index === focusedEntryIndex;
