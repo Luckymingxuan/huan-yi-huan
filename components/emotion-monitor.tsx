@@ -81,7 +81,9 @@ function EmotionChart({
   const chartRef = useRef<HTMLDivElement>(null);
   const isFollowingLatestRef = useRef(true);
   const isSelectionLockedRef = useRef(false);
+  const isUserInteractingRef = useRef(false);
   const touchDragRef = useRef(false);
+  const wheelIdleTimerRef = useRef<number | null>(null);
   const horizontalDragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -94,6 +96,7 @@ function EmotionChart({
   const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
   const latestSampleAt = samples.at(-1)?.recordedAt ?? 0;
   const resumeFollowingIfAtEnd = (chart: HTMLDivElement, releaseSelection = false) => {
+    if (isUserInteractingRef.current) return;
     const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
     if (
       distanceFromEnd <= AUTO_FOLLOW_RESUME_DISTANCE &&
@@ -122,6 +125,14 @@ function EmotionChart({
     isSelectionLockedRef.current = false;
     isFollowingLatestRef.current = true;
   }, [samples.length]);
+
+  useEffect(() => {
+    return () => {
+      if (wheelIdleTimerRef.current !== null) {
+        clearTimeout(wheelIdleTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
@@ -186,6 +197,8 @@ function EmotionChart({
       aria-label="情绪值历史图表"
       onPointerDown={(event) => {
         if (event.pointerType !== "mouse" || event.button !== 0) return;
+        isUserInteractingRef.current = true;
+        isFollowingLatestRef.current = false;
         const eventTarget = event.target;
         const selectedBar = eventTarget instanceof Element
           ? eventTarget.closest<HTMLButtonElement>("button[data-sample-index]")
@@ -214,6 +227,7 @@ function EmotionChart({
         if (!drag || drag.pointerId !== event.pointerId) return;
         ignoreClickRef.current = true;
         horizontalDragRef.current = null;
+        isUserInteractingRef.current = false;
         if (event.currentTarget.hasPointerCapture(event.pointerId)) {
           event.currentTarget.releasePointerCapture(event.pointerId);
         }
@@ -226,26 +240,43 @@ function EmotionChart({
           ignoreClickRef.current = false;
         }, 0);
       }}
-      onPointerCancel={() => {
+      onPointerCancel={(event) => {
         horizontalDragRef.current = null;
         ignoreClickRef.current = false;
+        isUserInteractingRef.current = false;
+        resumeFollowingIfAtEnd(event.currentTarget, true);
       }}
       onTouchStart={() => {
         touchDragRef.current = false;
+        isUserInteractingRef.current = true;
         isFollowingLatestRef.current = false;
       }}
       onTouchMove={() => {
         touchDragRef.current = true;
       }}
       onTouchEnd={(event) => {
+        isUserInteractingRef.current = false;
         resumeFollowingIfAtEnd(event.currentTarget, touchDragRef.current);
         touchDragRef.current = false;
       }}
+      onTouchCancel={(event) => {
+        touchDragRef.current = false;
+        isUserInteractingRef.current = false;
+        resumeFollowingIfAtEnd(event.currentTarget, true);
+      }}
       onWheel={(event) => {
         if (Math.abs(event.deltaX) > 0 || event.shiftKey) {
+          isUserInteractingRef.current = true;
           isFollowingLatestRef.current = false;
           const chart = event.currentTarget;
-          window.setTimeout(() => resumeFollowingIfAtEnd(chart, true), 80);
+          if (wheelIdleTimerRef.current !== null) {
+            clearTimeout(wheelIdleTimerRef.current);
+          }
+          wheelIdleTimerRef.current = window.setTimeout(() => {
+            isUserInteractingRef.current = false;
+            resumeFollowingIfAtEnd(chart, true);
+            wheelIdleTimerRef.current = null;
+          }, 120);
         }
       }}
       onScroll={(event) => {
