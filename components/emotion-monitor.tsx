@@ -8,9 +8,11 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import Link from "next/link";
 import { MicOff, Pause, Play, Settings2 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { getReminderAudio, REMINDER_AUDIO_STORAGE_KEY } from "@/lib/reminder-audio";
 import { cn } from "@/lib/utils";
 
 type Sample = { value: number; recordedAt: number };
@@ -199,6 +201,9 @@ export function EmotionMonitor() {
   const lastSampleRef = useRef(0);
   const dragStartYRef = useRef<number | null>(null);
   const isPausedRef = useRef(false);
+  const reminderAudioRef = useRef<HTMLAudioElement | null>(null);
+  const highEmotionRef = useRef(false);
+  const lastReminderAtRef = useRef(0);
 
   const mood = getMoodLevel(emotionValue);
   const selectedSample = useMemo(() => {
@@ -219,6 +224,10 @@ export function EmotionMonitor() {
     streamRef.current = null;
     void audioContextRef.current?.close();
     audioContextRef.current = null;
+    reminderAudioRef.current?.pause();
+    if (reminderAudioRef.current) reminderAudioRef.current.currentTime = 0;
+    reminderAudioRef.current = null;
+    highEmotionRef.current = false;
     isPausedRef.current = false;
     setIsPaused(false);
     setIsListening(false);
@@ -236,6 +245,25 @@ export function EmotionMonitor() {
     setError(null);
 
     try {
+      let savedReminderId: string | null = null;
+      try {
+        savedReminderId = window.localStorage.getItem(REMINDER_AUDIO_STORAGE_KEY);
+      } catch {
+        // Storage can be unavailable in restrictive browser modes; use the default.
+      }
+      const reminder = getReminderAudio(savedReminderId);
+      const reminderAudio = new Audio(reminder.src);
+      reminderAudio.preload = "auto";
+      reminderAudio.volume = 0;
+      reminderAudioRef.current = reminderAudio;
+      void reminderAudio.play().then(() => {
+        reminderAudio.pause();
+        reminderAudio.currentTime = 0;
+        reminderAudio.volume = 1;
+      }).catch(() => {
+        reminderAudio.volume = 1;
+      });
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           autoGainControl: false,
@@ -256,6 +284,8 @@ export function EmotionMonitor() {
       audioContextRef.current = audioContext;
       lastVisualUpdateRef.current = 0;
       lastSampleRef.current = 0;
+      highEmotionRef.current = false;
+      lastReminderAtRef.current = 0;
       setSamples([]);
       setSelectedIndex(null);
       setElapsedSeconds(0);
@@ -280,6 +310,21 @@ export function EmotionMonitor() {
         const rms = Math.sqrt(squareSum / waveform.length);
         const dbfs = rms > 0 ? 20 * Math.log10(rms) : -60;
         const nextValue = clamp(Math.round(((dbfs + 60) / 60) * 100), 0, 100);
+
+        if (nextValue >= 72) {
+          const now = Date.now();
+          if (!highEmotionRef.current && now - lastReminderAtRef.current >= 10_000) {
+            const reminderAudio = reminderAudioRef.current;
+            if (reminderAudio) {
+              reminderAudio.currentTime = 0;
+              void reminderAudio.play().catch(() => undefined);
+            }
+            lastReminderAtRef.current = now;
+          }
+          highEmotionRef.current = true;
+        } else if (nextValue < 64) {
+          highEmotionRef.current = false;
+        }
 
         if (timestamp - lastVisualUpdateRef.current >= 120) {
           setEmotionValue(nextValue);
@@ -327,6 +372,7 @@ export function EmotionMonitor() {
     }
 
     await audioContext.suspend();
+    reminderAudioRef.current?.pause();
     isPausedRef.current = true;
     setIsPaused(true);
     if (elapsedTimerRef.current !== null) {
@@ -369,15 +415,17 @@ export function EmotionMonitor() {
           <p className="text-[17px] font-semibold tracking-[-0.025em]">缓一缓</p>
           <p className="mt-0.5 text-[11px] font-medium tracking-[0.08em] text-neutral-400">HUAN YI HUAN</p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="rounded-full bg-white/75 px-3 text-neutral-500 shadow-sm backdrop-blur-xl"
+        <Link
+          href="/settings"
+          className={buttonVariants({
+            variant: "outline",
+            size: "sm",
+            className: "rounded-full bg-white/75 px-3 text-neutral-500 shadow-sm backdrop-blur-xl",
+          })}
         >
           <Settings2 data-icon="inline-start" />
           设置
-        </Button>
+        </Link>
       </header>
 
       <section
