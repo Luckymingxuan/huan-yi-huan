@@ -127,4 +127,10 @@
   html {
     @apply font-sans;
   }
+  body {
+    overscroll-behavior: none;
+  }
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
 }
