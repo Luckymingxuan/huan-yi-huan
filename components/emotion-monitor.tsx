@@ -82,6 +82,7 @@ function EmotionChart({
   const horizontalDragRef = useRef<{ pointerId: number; startX: number; scrollLeft: number; moved: boolean } | null>(null);
   const ignoreClickRef = useRef(false);
   const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
+  const latestSampleAt = samples.at(-1)?.recordedAt ?? 0;
 
   useEffect(() => {
     if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
@@ -94,7 +95,7 @@ function EmotionChart({
       });
     });
     return () => cancelAnimationFrame(frame);
-  }, [expanded, samples.length]);
+  }, [expanded, latestSampleAt, samples.length]);
 
   useEffect(() => {
     if (expanded || !chartRef.current) return;
@@ -177,13 +178,21 @@ function EmotionChart({
         horizontalDragRef.current = null;
         ignoreClickRef.current = false;
       }}
+      onTouchStart={() => {
+        isFollowingLatestRef.current = false;
+      }}
+      onWheel={(event) => {
+        if (Math.abs(event.deltaX) > 0 || event.shiftKey) {
+          isFollowingLatestRef.current = false;
+        }
+      }}
       onScroll={(event) => {
         const chart = event.currentTarget;
         const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
-        isFollowingLatestRef.current = distanceFromEnd < 24;
+        if (distanceFromEnd < 24) isFollowingLatestRef.current = true;
       }}
     >
-      <div className="flex h-full w-max min-w-full flex-col px-1">
+      <div className="flex h-full w-max min-w-full flex-col pl-1 pr-14">
         <div className="flex min-h-0 flex-1 items-end gap-1.5">
           {samples.length === 0 ? (
             Array.from({ length: 16 }, (_, index) => (
