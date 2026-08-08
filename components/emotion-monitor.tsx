@@ -15,7 +15,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { getReminderAudio, REMINDER_AUDIO_STORAGE_KEY } from "@/lib/reminder-audio";
 import { cn } from "@/lib/utils";
 
-type Sample = { value: number; recordedAt: number };
+type Sample = { value: number; recordedAt: number; elapsedSeconds: number };
 type MoodLevel = { label: string; hint: string; color: string; softColor: string };
 type EmotionMessage = {
   type?: string;
@@ -114,6 +114,14 @@ function formatClock(timestamp: number) {
     second: "2-digit",
     hour12: false,
   }).format(timestamp);
+}
+
+function formatTimeline(totalSeconds: number) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const minuteAndSecond = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return hours > 0 ? `${String(hours).padStart(2, "0")}:${minuteAndSecond}` : minuteAndSecond;
 }
 
 function EmotionChart({
@@ -415,18 +423,49 @@ function EmotionChart({
           })}
         </div>
 
-        <div className="relative mt-3 flex h-2 shrink-0 items-end gap-1.5 opacity-60" aria-hidden="true">
-          <div className="absolute inset-x-0 bottom-0 h-px bg-neutral-300" />
-          {Array.from({ length: samples.length || 16 }, (_, index) => (
-            <span key={index} className="grid w-2 shrink-0 place-items-center">
-              <span
-                className={cn(
-                  "relative w-px bg-neutral-300",
-                  index % 6 === 0 ? "h-2" : index % 3 === 0 ? "h-1.5" : "h-1",
+        <div className="relative mt-3 flex h-8 shrink-0 items-start gap-1.5 text-neutral-300" aria-hidden="true">
+          <div className="absolute inset-x-0 top-2 h-px bg-current" />
+          {Array.from({ length: samples.length || 16 }, (_, index) => {
+            const sample = samples[index];
+            const previousSample = samples[index - 1];
+            const currentFiveSecondMark = sample
+              ? Math.floor(sample.elapsedSeconds / 5) * 5
+              : 0;
+            const previousFiveSecondMark = previousSample
+              ? Math.floor(previousSample.elapsedSeconds / 5) * 5
+              : -1;
+            const isLabeledTick = index === 0 || Boolean(
+              sample && previousSample && currentFiveSecondMark > previousFiveSecondMark,
+            );
+            const currentWholeSecond = sample ? Math.floor(sample.elapsedSeconds) : index / 2;
+            const previousWholeSecond = previousSample
+              ? Math.floor(previousSample.elapsedSeconds)
+              : -1;
+            const isWholeSecondTick = samples.length === 0
+              ? index % 2 === 0
+              : index === 0 || currentWholeSecond > previousWholeSecond;
+
+            return (
+              <span key={sample?.recordedAt ?? index} className="relative grid w-2 shrink-0 place-items-center">
+                <span
+                  className={cn(
+                    "relative w-px bg-current",
+                    isLabeledTick ? "h-3" : isWholeSecondTick ? "h-2" : "h-1",
+                  )}
+                />
+                {isLabeledTick && (
+                  <span
+                    className={cn(
+                      "absolute top-4 whitespace-nowrap text-[10px] font-medium tabular-nums text-current",
+                      index === 0 ? "left-3" : "left-1/2 -translate-x-1/2",
+                    )}
+                  >
+                    {formatTimeline(index === 0 ? 0 : currentFiveSecondMark)}
+                  </span>
                 )}
-              />
-            </span>
-          ))}
+              </span>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -453,6 +492,7 @@ export function EmotionMonitor() {
   const silentGainRef = useRef<GainNode | null>(null);
   const websocketRef = useRef<WebSocket | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const elapsedSecondsRef = useRef(0);
   const dragStartYRef = useRef<number | null>(null);
   const isPausedRef = useRef(false);
   const canSendAudioRef = useRef(false);
@@ -531,7 +571,10 @@ export function EmotionMonitor() {
 
     const recordedAt = Date.now();
     setEmotionValue(nextValue);
-    setSamples((current) => [...current, { value: nextValue, recordedAt }]);
+    setSamples((current) => [
+      ...current,
+      { value: nextValue, recordedAt, elapsedSeconds: elapsedSecondsRef.current },
+    ]);
   }, []);
 
   const startListening = async () => {
@@ -580,6 +623,7 @@ export function EmotionMonitor() {
       setSamples([]);
       setSelectedIndex(null);
       setElapsedSeconds(0);
+      elapsedSecondsRef.current = 0;
       isPausedRef.current = false;
       setIsPaused(false);
 
@@ -679,7 +723,8 @@ export function EmotionMonitor() {
       setIsListening(true);
 
       elapsedTimerRef.current = setInterval(() => {
-        setElapsedSeconds((seconds) => seconds + 1);
+        elapsedSecondsRef.current += 1;
+        setElapsedSeconds(elapsedSecondsRef.current);
       }, 1000);
     } catch (cause) {
       const permissionDenied =
@@ -709,7 +754,8 @@ export function EmotionMonitor() {
       isPausedRef.current = false;
       setIsPaused(false);
       elapsedTimerRef.current = setInterval(() => {
-        setElapsedSeconds((seconds) => seconds + 1);
+        elapsedSecondsRef.current += 1;
+        setElapsedSeconds(elapsedSecondsRef.current);
       }, 1000);
       return;
     }
