@@ -7,11 +7,17 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import Link from "next/link";
 import { MicOff, Pause, Play, Settings2 } from "lucide-react";
 
 import { Button, buttonVariants } from "@/components/ui/button";
+import {
+  ConversationTranscript,
+  type TranscriptEntry,
+} from "@/components/conversation-transcript";
 import {
   ALARM_SENSITIVITY_STORAGE_KEY,
   DEFAULT_ALARM_SENSITIVITY,
@@ -35,12 +41,29 @@ import {
 import { cn } from "@/lib/utils";
 
 type Sample = { value: number; recordedAt: number; elapsedSeconds: number };
+type SheetStage = "collapsed" | "overview" | "transcript";
+type SheetMouseDrag = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  mode: "pending" | "horizontal" | "vertical";
+  transcriptList: HTMLElement | null;
+  transcriptScrollTop: number;
+};
 type MoodLevel = { label: string; hint: string; color: string; softColor: string };
 type EmotionMessage = {
   type?: string;
   emotions?: string[];
   mode?: string;
   probs?: number[];
+};
+type ConversationMessage = {
+  type?: string;
+  mode?: string;
+  spk?: number;
+  start_ms?: number;
+  end_ms?: number;
+  text?: string;
 };
 type RollingPcmBuffer = {
   samples: Float32Array;
@@ -599,6 +622,7 @@ function EmotionChart({
 export function EmotionMonitor() {
   const [emotionValue, setEmotionValue] = useState(0);
   const [samples, setSamples] = useState<Sample[]>([]);
+  const [transcriptEntries, setTranscriptEntries] = useState<TranscriptEntry[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -606,7 +630,7 @@ export function EmotionMonitor() {
   const [isReplaying, setIsReplaying] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState(false);
+  const [sheetStage, setSheetStage] = useState<SheetStage>("collapsed");
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [dragOffset, setDragOffset] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
@@ -617,12 +641,21 @@ export function EmotionMonitor() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const silentGainRef = useRef<GainNode | null>(null);
   const websocketRef = useRef<WebSocket | null>(null);
+  const transcriptWebsocketRef = useRef<WebSocket | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedSecondsRef = useRef(0);
+  const sheetRef = useRef<HTMLElement | null>(null);
   const dragStartYRef = useRef<number | null>(null);
+  const sheetMouseDragRef = useRef<SheetMouseDrag | null>(null);
+  const sheetTouchStartYRef = useRef<number | null>(null);
+  const wheelGestureConsumedRef = useRef(false);
+  const wheelGestureIdleTimerRef = useRef<number | null>(null);
   const isPausedRef = useRef(false);
   const canSendAudioRef = useRef(false);
+  const canSendTranscriptAudioRef = useRef(false);
   const emotionLabelsRef = useRef<string[]>([]);
+  const transcriptTimelineOffsetMsRef = useRef(0);
+  const transcriptSequenceRef = useRef(0);
   const reminderAudioRef = useRef<HTMLAudioElement | null>(null);
   const reminderOptionRef = useRef<ReminderOptionId>(RECENT_AUDIO_REPLAY_ID);
   const replayEffectRef = useRef<ReplayEffectId>(DEFAULT_REPLAY_EFFECT_ID);
@@ -644,11 +677,21 @@ export function EmotionMonitor() {
   const lastReminderAtRef = useRef(0);
   const alarmThresholdsRef = useRef(getAlarmThresholds(DEFAULT_ALARM_SENSITIVITY));
 
+  const expanded = sheetStage !== "collapsed";
+  const isTranscriptStage = sheetStage === "transcript";
   const mood = getMoodLevel(emotionValue);
   const selectedSample = useMemo(() => {
     if (samples.length === 0) return null;
     return samples[selectedIndex ?? samples.length - 1] ?? samples[samples.length - 1];
   }, [samples, selectedIndex]);
+
+  useEffect(() => {
+    return () => {
+      if (wheelGestureIdleTimerRef.current !== null) {
+        clearTimeout(wheelGestureIdleTimerRef.current);
+      }
+    };
+  }, []);
 
   const stopActiveReplay = useCallback(() => {
     replayRequestIdRef.current += 1;
@@ -691,6 +734,7 @@ export function EmotionMonitor() {
     }
     stopActiveReplay();
     canSendAudioRef.current = false;
+    canSendTranscriptAudioRef.current = false;
     emotionLabelsRef.current = [];
     const websocket = websocketRef.current;
     websocketRef.current = null;
@@ -701,6 +745,20 @@ export function EmotionMonitor() {
       websocket.onclose = null;
       if (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING) {
         websocket.close();
+      }
+    }
+    const transcriptWebsocket = transcriptWebsocketRef.current;
+    transcriptWebsocketRef.current = null;
+    if (transcriptWebsocket) {
+      transcriptWebsocket.onopen = null;
+      transcriptWebsocket.onmessage = null;
+      transcriptWebsocket.onerror = null;
+      transcriptWebsocket.onclose = null;
+      if (
+        transcriptWebsocket.readyState === WebSocket.OPEN ||
+        transcriptWebsocket.readyState === WebSocket.CONNECTING
+      ) {
+        transcriptWebsocket.close();
       }
     }
     if (processorRef.current) {
@@ -753,6 +811,11 @@ export function EmotionMonitor() {
     if (websocket?.readyState === WebSocket.OPEN) {
       websocket.send(JSON.stringify({ type: "reset" }));
     }
+    transcriptTimelineOffsetMsRef.current = elapsedSecondsRef.current * 1000;
+    const transcriptWebsocket = transcriptWebsocketRef.current;
+    if (transcriptWebsocket?.readyState === WebSocket.OPEN) {
+      transcriptWebsocket.send(JSON.stringify({ type: "reset" }));
+    }
 
     let replayBuffer = audioBuffer;
     if (pitchSemitones !== 0) {
@@ -802,6 +865,11 @@ export function EmotionMonitor() {
         const activeWebsocket = websocketRef.current;
         if (activeWebsocket?.readyState === WebSocket.OPEN) {
           activeWebsocket.send(JSON.stringify({ type: "reset" }));
+        }
+        transcriptTimelineOffsetMsRef.current = elapsedSecondsRef.current * 1000;
+        const activeTranscriptWebsocket = transcriptWebsocketRef.current;
+        if (activeTranscriptWebsocket?.readyState === WebSocket.OPEN) {
+          activeTranscriptWebsocket.send(JSON.stringify({ type: "reset" }));
         }
       }, REPLAY_FEEDBACK_GUARD_MS);
     };
@@ -979,16 +1047,19 @@ export function EmotionMonitor() {
       latestEmotionValueRef.current = 0;
       setEmotionValue(0);
       setSamples([]);
+      setTranscriptEntries([]);
       setSelectedIndex(null);
       setElapsedSeconds(0);
       elapsedSecondsRef.current = 0;
+      transcriptTimelineOffsetMsRef.current = 0;
+      transcriptSequenceRef.current = 0;
       isPausedRef.current = false;
       isReplayingRef.current = false;
       setIsPaused(false);
       setIsReplayPending(false);
       setIsReplaying(false);
 
-      const websocket = await new Promise<WebSocket>((resolve, reject) => {
+      const emotionWebsocketPromise = new Promise<WebSocket>((resolve, reject) => {
         const socket = new WebSocket(getEmotionWebSocketUrl());
         websocketRef.current = socket;
         let settled = false;
@@ -1056,6 +1127,90 @@ export function EmotionMonitor() {
         };
       });
 
+      const transcriptWebsocketPromise = new Promise<WebSocket>((resolve, reject) => {
+        const socket = new WebSocket(getEmotionWebSocketUrl());
+        transcriptWebsocketRef.current = socket;
+        let settled = false;
+        const connectionTimeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          socket.close();
+          reject(new Error("transcript-service-timeout"));
+        }, 10_000);
+
+        const failConnection = () => {
+          canSendTranscriptAudioRef.current = false;
+          if (!settled) {
+            settled = true;
+            window.clearTimeout(connectionTimeout);
+            reject(new Error("transcript-service-unavailable"));
+            return;
+          }
+          if (transcriptWebsocketRef.current !== socket) return;
+          stopListening();
+          setError("对话转写连接已断开，请检查服务后重试。");
+        };
+
+        socket.binaryType = "arraybuffer";
+        socket.onerror = () => {
+          if (!settled) failConnection();
+        };
+        socket.onclose = failConnection;
+        socket.onmessage = (event) => {
+          if (typeof event.data !== "string") return;
+
+          let message: ConversationMessage;
+          try {
+            message = JSON.parse(event.data) as ConversationMessage;
+          } catch {
+            return;
+          }
+
+          if (message.type === "ready") {
+            socket.send(JSON.stringify({ type: "mode", mode: "conversation" }));
+            return;
+          }
+
+          if (message.type === "ack" && message.mode === "conversation") {
+            canSendTranscriptAudioRef.current = true;
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(connectionTimeout);
+              resolve(socket);
+            }
+            return;
+          }
+
+          const text = message.text?.trim();
+          if (
+            message.type !== "utterance" ||
+            !text ||
+            !Number.isFinite(message.spk) ||
+            !Number.isFinite(message.start_ms) ||
+            !Number.isFinite(message.end_ms)
+          ) {
+            return;
+          }
+
+          const offsetSeconds = transcriptTimelineOffsetMsRef.current / 1000;
+          setTranscriptEntries((current) => [
+            ...current,
+            {
+              id: ++transcriptSequenceRef.current,
+              speaker: Math.max(0, Math.trunc(message.spk as number)),
+              startSeconds: offsetSeconds + (message.start_ms as number) / 1000,
+              endSeconds: offsetSeconds + (message.end_ms as number) / 1000,
+              text,
+            },
+          ]);
+        };
+      });
+
+      const [websocket, transcriptWebsocket] = await Promise.all([
+        emotionWebsocketPromise,
+        transcriptWebsocketPromise,
+      ]);
+
       const mediaSource = audioContext.createMediaStreamSource(stream);
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       const silentGain = audioContext.createGain();
@@ -1100,13 +1255,19 @@ export function EmotionMonitor() {
         }
         const pcm = resampleToPcm16(input, audioContext.sampleRate);
         if (
-          !canSendAudioRef.current ||
-          websocket.readyState !== WebSocket.OPEN ||
-          websocket.bufferedAmount > MAX_WEBSOCKET_BUFFER
+          canSendAudioRef.current &&
+          websocket.readyState === WebSocket.OPEN &&
+          websocket.bufferedAmount <= MAX_WEBSOCKET_BUFFER
         ) {
-          return;
+          websocket.send(pcm.buffer);
         }
-        websocket.send(pcm.buffer);
+        if (
+          canSendTranscriptAudioRef.current &&
+          transcriptWebsocket.readyState === WebSocket.OPEN &&
+          transcriptWebsocket.bufferedAmount <= MAX_WEBSOCKET_BUFFER
+        ) {
+          transcriptWebsocket.send(pcm.buffer);
+        }
       };
 
       setIsListening(true);
@@ -1120,12 +1281,14 @@ export function EmotionMonitor() {
         cause instanceof DOMException &&
         (cause.name === "NotAllowedError" || cause.name === "PermissionDeniedError");
       const serviceUnavailable =
-        cause instanceof Error && cause.message.startsWith("emotion-service-");
+        cause instanceof Error &&
+        (cause.message.startsWith("emotion-service-") ||
+          cause.message.startsWith("transcript-service-"));
       setError(
         permissionDenied
           ? "没有获得麦克风权限。请在浏览器设置中允许后重试。"
           : serviceUnavailable
-            ? "无法连接情绪识别服务，请确认 FastAPI 服务可用后重试。"
+            ? "无法连接情绪识别与转写服务，请确认 FastAPI 服务可用后重试。"
           : "暂时无法使用麦克风，请检查设备后重试。",
       );
       stopListening();
@@ -1155,12 +1318,165 @@ export function EmotionMonitor() {
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
       websocketRef.current.send(JSON.stringify({ type: "reset" }));
     }
+    transcriptTimelineOffsetMsRef.current = elapsedSecondsRef.current * 1000;
+    if (transcriptWebsocketRef.current?.readyState === WebSocket.OPEN) {
+      transcriptWebsocketRef.current.send(JSON.stringify({ type: "reset" }));
+    }
     await audioContext.suspend();
     reminderAudioRef.current?.pause();
     if (elapsedTimerRef.current !== null) {
       clearInterval(elapsedTimerRef.current);
       elapsedTimerRef.current = null;
     }
+  };
+
+  const advanceSheetStage = () => {
+    setSheetStage((current) => {
+      if (current === "collapsed") return "overview";
+      if (current === "overview") return "transcript";
+      return current;
+    });
+  };
+
+  const retreatSheetStage = () => {
+    setSheetStage((current) => {
+      if (current === "transcript") return "overview";
+      if (current === "overview") return "collapsed";
+      return current;
+    });
+  };
+
+  const handleSheetWheel = (event: ReactWheelEvent<HTMLElement>) => {
+    if (wheelGestureIdleTimerRef.current !== null) {
+      clearTimeout(wheelGestureIdleTimerRef.current);
+    }
+    wheelGestureIdleTimerRef.current = window.setTimeout(() => {
+      wheelGestureIdleTimerRef.current = null;
+      wheelGestureConsumedRef.current = false;
+    }, 180);
+
+    if (wheelGestureConsumedRef.current) {
+      event.preventDefault();
+      return;
+    }
+
+    if (event.deltaY > 10 && sheetStage !== "transcript") {
+      event.preventDefault();
+      wheelGestureConsumedRef.current = true;
+      advanceSheetStage();
+      return;
+    }
+
+    if (
+      event.deltaY < -10 &&
+      (sheetStage === "overview" ||
+        (sheetStage === "transcript" &&
+          event.currentTarget.scrollTop <= 2 &&
+          !(
+            event.target instanceof Element &&
+            event.target.closest<HTMLElement>("[data-transcript-list]")?.scrollTop
+          )))
+    ) {
+      event.preventDefault();
+      wheelGestureConsumedRef.current = true;
+      retreatSheetStage();
+    }
+  };
+
+  const handleSheetTouchStart = (event: ReactTouchEvent<HTMLElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const transcriptList = target?.closest<HTMLElement>("[data-transcript-list]") ?? null;
+    if (target?.closest("[data-sheet-handle]")) {
+      sheetTouchStartYRef.current = null;
+      return;
+    }
+    if (sheetStage === "transcript" && transcriptList && transcriptList.scrollTop > 0) {
+      sheetTouchStartYRef.current = null;
+      return;
+    }
+    sheetTouchStartYRef.current = event.touches[0]?.clientY ?? null;
+  };
+
+  const handleSheetTouchEnd = (event: ReactTouchEvent<HTMLElement>) => {
+    const startY = sheetTouchStartYRef.current;
+    sheetTouchStartYRef.current = null;
+    const endY = event.changedTouches[0]?.clientY;
+    if (startY === null || endY === undefined) return;
+
+    const delta = endY - startY;
+    if (delta < -48) advanceSheetStage();
+    else if (delta > 48) retreatSheetStage();
+  };
+
+  const handleSheetMousePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType !== "mouse" || event.button !== 0) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest("[data-sheet-handle]")) return;
+
+    const transcriptList = target?.closest<HTMLElement>("[data-transcript-list]") ?? null;
+    sheetMouseDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      mode: "pending",
+      transcriptList,
+      transcriptScrollTop: transcriptList?.scrollTop ?? 0,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleSheetMousePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = sheetMouseDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
+
+    if (drag.mode === "pending") {
+      if (Math.max(Math.abs(deltaX), Math.abs(deltaY)) < 7) return;
+      drag.mode = Math.abs(deltaY) > Math.abs(deltaX) + 4 ? "vertical" : "horizontal";
+    }
+    if (drag.mode !== "vertical") return;
+
+    event.preventDefault();
+    setIsDragging(true);
+    if (sheetStage === "transcript" && drag.transcriptList) {
+      drag.transcriptList.scrollTop = Math.max(0, drag.transcriptScrollTop - deltaY);
+      const unconsumedDownwardDrag = Math.max(0, deltaY - drag.transcriptScrollTop);
+      setDragOffset(clamp(unconsumedDownwardDrag, 0, 240));
+      return;
+    }
+
+    if (sheetStage === "collapsed") setDragOffset(clamp(deltaY, -240, 0));
+    else if (sheetStage === "overview") setDragOffset(clamp(deltaY, -180, 240));
+    else setDragOffset(clamp(deltaY, 0, 240));
+  };
+
+  const finishSheetMouseDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = sheetMouseDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    sheetMouseDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (drag.mode === "vertical") {
+      const deltaY = event.clientY - drag.startY;
+      const stageDeltaY = sheetStage === "transcript" && drag.transcriptList
+        ? deltaY - drag.transcriptScrollTop
+        : deltaY;
+      if (stageDeltaY < -48) advanceSheetStage();
+      else if (stageDeltaY > 48) retreatSheetStage();
+    }
+    setDragOffset(0);
+    setIsDragging(false);
+  };
+
+  const cancelSheetMouseDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = sheetMouseDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    sheetMouseDragRef.current = null;
+    setDragOffset(0);
+    setIsDragging(false);
   };
 
   const handleSheetPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1172,15 +1488,25 @@ export function EmotionMonitor() {
   const handleSheetPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (dragStartYRef.current === null) return;
     const delta = event.clientY - dragStartYRef.current;
-    setDragOffset(expanded ? clamp(delta, 0, 240) : clamp(delta, -240, 0));
+    if (sheetStage === "collapsed") setDragOffset(clamp(delta, -240, 0));
+    else if (sheetStage === "overview") setDragOffset(clamp(delta, -180, 240));
+    else setDragOffset(clamp(delta, 0, 240));
   };
 
   const handleSheetPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (dragStartYRef.current === null) return;
     const delta = event.clientY - dragStartYRef.current;
-    if (Math.abs(delta) < 8) setExpanded((current) => !current);
-    else if (delta < -48) setExpanded(true);
-    else if (delta > 48) setExpanded(false);
+    if (Math.abs(delta) < 8) {
+      setSheetStage((current) => {
+        if (current === "collapsed") return "overview";
+        if (current === "transcript") return "overview";
+        return "collapsed";
+      });
+    } else if (delta < -48) {
+      advanceSheetStage();
+    } else if (delta > 48) {
+      retreatSheetStage();
+    }
     dragStartYRef.current = null;
     setDragOffset(0);
     setIsDragging(false);
@@ -1301,17 +1627,36 @@ export function EmotionMonitor() {
       )}
 
       <section
+        ref={sheetRef}
         className={cn(
-          "absolute inset-x-0 top-[10.75rem] z-20 flex min-h-[calc(100dvh-10.75rem)] flex-col overflow-y-auto overscroll-contain rounded-t-[2.25rem] bg-white/94 px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] shadow-[0_-18px_60px_rgba(0,0,0,0.08)] backdrop-blur-2xl",
-          !isDragging && "transition-transform duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
+          "absolute inset-x-0 bottom-0 z-20 flex flex-col overscroll-contain rounded-t-[2.25rem] bg-white/94 px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] shadow-[0_-18px_60px_rgba(0,0,0,0.08)] backdrop-blur-2xl",
+          isTranscriptStage ? "top-[4.75rem] overflow-y-auto" : "top-[10.75rem] overflow-hidden",
+          !isDragging && "transition-[top,transform] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
         )}
         style={{ transform: sheetTransform }}
+        onWheel={handleSheetWheel}
+        onTouchStart={handleSheetTouchStart}
+        onTouchEnd={handleSheetTouchEnd}
+        onPointerDownCapture={handleSheetMousePointerDown}
+        onPointerMoveCapture={handleSheetMousePointerMove}
+        onPointerUpCapture={finishSheetMouseDrag}
+        onPointerCancelCapture={cancelSheetMouseDrag}
       >
         <div
-          className="touch-none select-none rounded-t-[2.25rem] pt-3 focus-visible:outline-none"
+          data-sheet-handle
+          className={cn(
+            "touch-none select-none rounded-t-[2.25rem] pt-3 focus-visible:outline-none",
+            isTranscriptStage && "sticky top-0 z-20 -mx-5 bg-white/94 px-5 pb-3 backdrop-blur-2xl",
+          )}
           role="button"
           tabIndex={0}
-          aria-label={expanded ? "收起情绪记录" : "展开情绪记录"}
+          aria-label={
+            sheetStage === "collapsed"
+              ? "展开情绪记录"
+              : isTranscriptStage
+                ? "返回情绪概览"
+                : "收起情绪记录"
+          }
           aria-expanded={expanded}
           onPointerDown={handleSheetPointerDown}
           onPointerMove={handleSheetPointerMove}
@@ -1322,9 +1667,19 @@ export function EmotionMonitor() {
             setIsDragging(false);
           }}
           onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
+            if (event.key === "ArrowUp") {
               event.preventDefault();
-              setExpanded((current) => !current);
+              advanceSheetStage();
+            } else if (event.key === "ArrowDown") {
+              event.preventDefault();
+              retreatSheetStage();
+            } else if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setSheetStage((current) => {
+                if (current === "collapsed") return "overview";
+                if (current === "transcript") return "overview";
+                return "collapsed";
+              });
             }
           }}
         >
@@ -1362,27 +1717,59 @@ export function EmotionMonitor() {
         </div>
 
         {expanded && (
-          <div className="mt-8">
-            <EmotionChart
-              samples={samples}
-              selectedIndex={selectedIndex ?? Math.max(samples.length - 1, 0)}
-              expanded
-              onSelect={setSelectedIndex}
-            />
+          <div
+            className={cn(
+              "grid transition-[grid-template-rows,margin,opacity,transform] duration-700 ease-[cubic-bezier(.22,1,.36,1)]",
+              isTranscriptStage
+                ? "mt-0 grid-rows-[0fr] -translate-y-5 opacity-0"
+                : "mt-8 grid-rows-[1fr] translate-y-0 opacity-100",
+            )}
+          >
+            <div className="min-h-0 overflow-hidden">
+              <EmotionChart
+                samples={samples}
+                selectedIndex={selectedIndex ?? Math.max(samples.length - 1, 0)}
+                expanded
+                onSelect={setSelectedIndex}
+              />
+            </div>
           </div>
         )}
 
-        <div className={cn("grid overflow-hidden transition-[grid-template-rows,opacity,transform] duration-500", expanded ? "mt-8 grid-rows-[1fr] translate-y-0 opacity-100" : "grid-rows-[0fr] translate-y-5 opacity-0")}>
+        <div className={cn(
+          "grid overflow-hidden transition-[grid-template-rows,margin,opacity,transform] duration-500",
+          expanded
+            ? cn(
+                "grid-rows-[1fr] translate-y-0 opacity-100",
+                isTranscriptStage ? "mt-0" : "mt-8",
+              )
+            : "grid-rows-[0fr] translate-y-5 opacity-0",
+        )}>
           <div className="min-h-0 text-center">
-            <p className="text-xs font-medium tracking-[0.08em] text-neutral-400">{selectedIndex === null ? "当前" : "所选时刻"}</p>
-            <div className="mt-3 flex items-baseline justify-center gap-2">
-              <span className="text-4xl font-semibold tabular-nums tracking-[-0.06em]">{selectedSample?.value ?? 0}</span>
-              <span className="text-sm text-neutral-400">情绪值</span>
+            <div
+              className={cn(
+                "grid transition-[grid-template-rows,opacity,transform] duration-500 ease-[cubic-bezier(.22,1,.36,1)]",
+                isTranscriptStage
+                  ? "grid-rows-[0fr] -translate-y-4 opacity-0"
+                  : "grid-rows-[1fr] translate-y-0 opacity-100",
+              )}
+            >
+              <div className="min-h-0 overflow-hidden">
+                <p className="text-xs font-medium tracking-[0.08em] text-neutral-400">{selectedIndex === null ? "当前" : "所选时刻"}</p>
+                <div className="mt-3 flex items-baseline justify-center gap-2">
+                  <span className="text-4xl font-semibold tabular-nums tracking-[-0.06em]">{selectedSample?.value ?? 0}</span>
+                  <span className="text-sm text-neutral-400">情绪值</span>
+                </div>
+                <p className="mt-2 text-sm tabular-nums text-neutral-400">{selectedSample ? formatClock(selectedSample.recordedAt) : "等待第一条记录"}</p>
+              </div>
             </div>
-            <p className="mt-2 text-sm tabular-nums text-neutral-400">{selectedSample ? formatClock(selectedSample.recordedAt) : "等待第一条记录"}</p>
-            <div className="mx-auto mt-8 h-px w-12 bg-neutral-200" />
-            <p className="mt-8 text-lg font-medium tracking-tight">此刻发生了什么？</p>
-            <p className="mx-auto mt-2 max-w-64 text-sm leading-6 text-neutral-400">不急着回答。先看见它，然后缓一缓。</p>
+            <ConversationTranscript
+              entries={transcriptEntries}
+              targetSeconds={selectedSample?.elapsedSeconds ?? null}
+              isListening={isListening}
+              isPaused={isPaused}
+              immersive={isTranscriptStage}
+            />
           </div>
         </div>
       </section>
