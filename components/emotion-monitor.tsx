@@ -24,7 +24,6 @@ type EmotionMessage = {
   probs?: number[];
 };
 
-const MAX_SAMPLES = 90;
 const DEFAULT_COLLAPSED_SAMPLE_LIMIT = 22;
 const COLLAPSED_BAR_STEP = 12;
 const AUTO_FOLLOW_RESUME_DISTANCE = 4;
@@ -134,6 +133,7 @@ function EmotionChart({
   const isUserInteractingRef = useRef(false);
   const touchDragRef = useRef(false);
   const wheelIdleTimerRef = useRef<number | null>(null);
+  const autoFollowFrameRef = useRef<number | null>(null);
   const horizontalDragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -145,6 +145,19 @@ function EmotionChart({
   const ignoreClickRef = useRef(false);
   const [collapsedSampleLimit, setCollapsedSampleLimit] = useState(DEFAULT_COLLAPSED_SAMPLE_LIMIT);
   const latestSampleAt = samples.at(-1)?.recordedAt ?? 0;
+  const cancelPendingAutoFollow = (chart?: HTMLDivElement) => {
+    if (autoFollowFrameRef.current !== null) {
+      cancelAnimationFrame(autoFollowFrameRef.current);
+      autoFollowFrameRef.current = null;
+    }
+    if (wheelIdleTimerRef.current !== null) {
+      clearTimeout(wheelIdleTimerRef.current);
+      wheelIdleTimerRef.current = null;
+    }
+    if (chart) {
+      chart.scrollTo({ left: chart.scrollLeft, behavior: "auto" });
+    }
+  };
   const resumeFollowingIfAtEnd = (chart: HTMLDivElement, releaseSelection = false) => {
     if (isUserInteractingRef.current) return;
     const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
@@ -154,14 +167,16 @@ function EmotionChart({
     ) {
       isSelectionLockedRef.current = false;
       isFollowingLatestRef.current = true;
+      if (releaseSelection) onSelect(null);
     }
   };
   const selectSample = (index: number, selectedBar: HTMLButtonElement) => {
+    const chart = chartRef.current;
+    cancelPendingAutoFollow(chart ?? undefined);
     isSelectionLockedRef.current = true;
     isFollowingLatestRef.current = false;
     onSelect(index);
 
-    const chart = chartRef.current;
     if (!chart) return;
     const selectedCenter = selectedBar.offsetLeft + selectedBar.offsetWidth / 2;
     chart.scrollTo({
@@ -181,20 +196,37 @@ function EmotionChart({
       if (wheelIdleTimerRef.current !== null) {
         clearTimeout(wheelIdleTimerRef.current);
       }
+      if (autoFollowFrameRef.current !== null) {
+        cancelAnimationFrame(autoFollowFrameRef.current);
+      }
     };
   }, []);
 
   useEffect(() => {
     if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
     const frame = requestAnimationFrame(() => {
+      autoFollowFrameRef.current = null;
       const chart = chartRef.current;
-      if (!chart) return;
+      if (
+        !chart ||
+        !isFollowingLatestRef.current ||
+        isSelectionLockedRef.current ||
+        isUserInteractingRef.current
+      ) {
+        return;
+      }
       chart.scrollTo({
         left: chart.scrollWidth,
         behavior: samples.length > 24 ? "smooth" : "auto",
       });
     });
-    return () => cancelAnimationFrame(frame);
+    autoFollowFrameRef.current = frame;
+    return () => {
+      cancelAnimationFrame(frame);
+      if (autoFollowFrameRef.current === frame) {
+        autoFollowFrameRef.current = null;
+      }
+    };
   }, [expanded, latestSampleAt, samples.length]);
 
   useEffect(() => {
@@ -247,6 +279,7 @@ function EmotionChart({
       aria-label="情绪值历史图表"
       onPointerDown={(event) => {
         if (event.pointerType !== "mouse" || event.button !== 0) return;
+        cancelPendingAutoFollow(event.currentTarget);
         isUserInteractingRef.current = true;
         isFollowingLatestRef.current = false;
         const eventTarget = event.target;
@@ -296,7 +329,8 @@ function EmotionChart({
         isUserInteractingRef.current = false;
         resumeFollowingIfAtEnd(event.currentTarget, true);
       }}
-      onTouchStart={() => {
+      onTouchStart={(event) => {
+        cancelPendingAutoFollow(event.currentTarget);
         touchDragRef.current = false;
         isUserInteractingRef.current = true;
         isFollowingLatestRef.current = false;
@@ -316,6 +350,7 @@ function EmotionChart({
       }}
       onWheel={(event) => {
         if (Math.abs(event.deltaX) > 0 || event.shiftKey) {
+          cancelPendingAutoFollow(event.currentTarget);
           isUserInteractingRef.current = true;
           isFollowingLatestRef.current = false;
           const chart = event.currentTarget;
@@ -496,10 +531,7 @@ export function EmotionMonitor() {
 
     const recordedAt = Date.now();
     setEmotionValue(nextValue);
-    setSamples((current) => [
-      ...current.slice(-(MAX_SAMPLES - 1)),
-      { value: nextValue, recordedAt },
-    ]);
+    setSamples((current) => [...current, { value: nextValue, recordedAt }]);
   }, []);
 
   const startListening = async () => {
