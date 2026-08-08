@@ -17,14 +17,62 @@ import { cn } from "@/lib/utils";
 
 type Sample = { value: number; recordedAt: number };
 type MoodLevel = { label: string; hint: string; color: string; softColor: string };
+type EmotionMessage = {
+  type?: string;
+  emotions?: string[];
+  mode?: string;
+  probs?: number[];
+};
 
 const MAX_SAMPLES = 90;
 const DEFAULT_COLLAPSED_SAMPLE_LIMIT = 22;
 const COLLAPSED_BAR_STEP = 12;
 const AUTO_FOLLOW_RESUME_DISTANCE = 4;
+const TARGET_SAMPLE_RATE = 16_000;
+const MAX_WEBSOCKET_BUFFER = 512 * 1024;
+const FASTAPI_HOST = process.env.NEXT_PUBLIC_FASTAPI_HOST?.trim() || "127.0.0.1";
+const FASTAPI_PORT = process.env.NEXT_PUBLIC_FASTAPI_PORT?.trim() || "8000";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function getEmotionWebSocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${FASTAPI_HOST}:${FASTAPI_PORT}/ws`;
+}
+
+function getNegativeEmotionValue(probs: number[], emotions: string[]) {
+  const normalizedEmotions = emotions.map((emotion) => emotion.toLowerCase());
+  const angryIndex = normalizedEmotions.indexOf("angry");
+  const disgustedIndex = normalizedEmotions.indexOf("disgusted");
+  if (angryIndex < 0 || disgustedIndex < 0) return null;
+
+  const angry = clamp(Number(probs[angryIndex]) || 0, 0, 1);
+  const disgusted = clamp(Number(probs[disgustedIndex]) || 0, 0, 1);
+  const strongerEmotion = Math.max(angry, disgusted);
+  const weakerEmotion = Math.min(angry, disgusted);
+  return Math.round((strongerEmotion * 0.9 + weakerEmotion * 0.1) * 100);
+}
+
+function resampleToPcm16(input: Float32Array, sourceSampleRate: number) {
+  const outputLength = Math.max(
+    1,
+    Math.round(input.length * TARGET_SAMPLE_RATE / sourceSampleRate),
+  );
+  const output = new Int16Array(outputLength);
+  const sampleRateRatio = sourceSampleRate / TARGET_SAMPLE_RATE;
+
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourcePosition = index * sampleRateRatio;
+    const leftIndex = Math.floor(sourcePosition);
+    const rightIndex = Math.min(leftIndex + 1, input.length - 1);
+    const interpolation = sourcePosition - leftIndex;
+    const sample = input[leftIndex] * (1 - interpolation) + input[rightIndex] * interpolation;
+    output[index] = Math.round(clamp(sample, -1, 1) * 32767);
+  }
+
+  return output;
 }
 
 function getMoodLevel(value: number): MoodLevel {
@@ -363,12 +411,15 @@ export function EmotionMonitor() {
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
+  const mediaSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const silentGainRef = useRef<GainNode | null>(null);
+  const websocketRef = useRef<WebSocket | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastVisualUpdateRef = useRef(0);
-  const lastSampleRef = useRef(0);
   const dragStartYRef = useRef<number | null>(null);
   const isPausedRef = useRef(false);
+  const canSendAudioRef = useRef(false);
+  const emotionLabelsRef = useRef<string[]>([]);
   const reminderAudioRef = useRef<HTMLAudioElement | null>(null);
   const highEmotionRef = useRef(false);
   const lastReminderAtRef = useRef(0);
@@ -380,14 +431,32 @@ export function EmotionMonitor() {
   }, [samples, selectedIndex]);
 
   const stopListening = useCallback(() => {
-    if (animationFrameRef.current !== null) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
     if (elapsedTimerRef.current !== null) {
       clearInterval(elapsedTimerRef.current);
       elapsedTimerRef.current = null;
     }
+    canSendAudioRef.current = false;
+    emotionLabelsRef.current = [];
+    const websocket = websocketRef.current;
+    websocketRef.current = null;
+    if (websocket) {
+      websocket.onopen = null;
+      websocket.onmessage = null;
+      websocket.onerror = null;
+      websocket.onclose = null;
+      if (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING) {
+        websocket.close();
+      }
+    }
+    if (processorRef.current) {
+      processorRef.current.onaudioprocess = null;
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    mediaSourceRef.current?.disconnect();
+    mediaSourceRef.current = null;
+    silentGainRef.current?.disconnect();
+    silentGainRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     void audioContextRef.current?.close();
@@ -402,6 +471,34 @@ export function EmotionMonitor() {
   }, []);
 
   useEffect(() => stopListening, [stopListening]);
+
+  const applyEmotionResult = useCallback((probs: number[]) => {
+    if (isPausedRef.current) return;
+    const nextValue = getNegativeEmotionValue(probs, emotionLabelsRef.current);
+    if (nextValue === null) return;
+
+    if (nextValue >= 72) {
+      const now = Date.now();
+      if (!highEmotionRef.current && now - lastReminderAtRef.current >= 10_000) {
+        const reminderAudio = reminderAudioRef.current;
+        if (reminderAudio) {
+          reminderAudio.currentTime = 0;
+          void reminderAudio.play().catch(() => undefined);
+        }
+        lastReminderAtRef.current = now;
+      }
+      highEmotionRef.current = true;
+    } else if (nextValue < 64) {
+      highEmotionRef.current = false;
+    }
+
+    const recordedAt = Date.now();
+    setEmotionValue(nextValue);
+    setSamples((current) => [
+      ...current.slice(-(MAX_SAMPLES - 1)),
+      { value: nextValue, recordedAt },
+    ]);
+  }, []);
 
   const startListening = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -442,81 +539,125 @@ export function EmotionMonitor() {
       streamRef.current = stream;
       const audioContext = new window.AudioContext();
       await audioContext.resume();
-
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0.72;
-      audioContext.createMediaStreamSource(stream).connect(analyser);
-
-      const waveform = new Float32Array(analyser.fftSize);
       audioContextRef.current = audioContext;
-      lastVisualUpdateRef.current = 0;
-      lastSampleRef.current = 0;
       highEmotionRef.current = false;
       lastReminderAtRef.current = 0;
+      setEmotionValue(0);
       setSamples([]);
       setSelectedIndex(null);
       setElapsedSeconds(0);
       isPausedRef.current = false;
       setIsPaused(false);
+
+      const websocket = await new Promise<WebSocket>((resolve, reject) => {
+        const socket = new WebSocket(getEmotionWebSocketUrl());
+        websocketRef.current = socket;
+        let settled = false;
+        const connectionTimeout = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          socket.close();
+          reject(new Error("emotion-service-timeout"));
+        }, 10_000);
+
+        const failConnection = () => {
+          canSendAudioRef.current = false;
+          if (!settled) {
+            settled = true;
+            window.clearTimeout(connectionTimeout);
+            reject(new Error("emotion-service-unavailable"));
+            return;
+          }
+          if (websocketRef.current !== socket) return;
+          stopListening();
+          setError("情绪识别服务连接已断开，请检查服务后重试。");
+        };
+
+        socket.binaryType = "arraybuffer";
+        socket.onerror = () => {
+          if (!settled) failConnection();
+        };
+        socket.onclose = failConnection;
+        socket.onmessage = (event) => {
+          if (typeof event.data !== "string") return;
+
+          let message: EmotionMessage;
+          try {
+            message = JSON.parse(event.data) as EmotionMessage;
+          } catch {
+            return;
+          }
+
+          if (message.type === "ready" && Array.isArray(message.emotions)) {
+            emotionLabelsRef.current = message.emotions;
+            socket.send(JSON.stringify({ type: "mode", mode: "sliding" }));
+            return;
+          }
+
+          if (message.type === "ack" && message.mode === "sliding") {
+            canSendAudioRef.current = true;
+            socket.send(JSON.stringify({
+              type: "config",
+              window_s: 2,
+              hop_s: 0.5,
+              smoothing: 0.7,
+              threshold: 0,
+            }));
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(connectionTimeout);
+              resolve(socket);
+            }
+            return;
+          }
+
+          if (message.type === "result" && Array.isArray(message.probs)) {
+            applyEmotionResult(message.probs);
+          }
+        };
+      });
+
+      const mediaSource = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+      mediaSource.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+      mediaSourceRef.current = mediaSource;
+      processorRef.current = processor;
+      silentGainRef.current = silentGain;
+      processor.onaudioprocess = (event) => {
+        if (
+          isPausedRef.current ||
+          !canSendAudioRef.current ||
+          websocket.readyState !== WebSocket.OPEN ||
+          websocket.bufferedAmount > MAX_WEBSOCKET_BUFFER
+        ) {
+          return;
+        }
+
+        const input = event.inputBuffer.getChannelData(0);
+        const pcm = resampleToPcm16(input, audioContext.sampleRate);
+        websocket.send(pcm.buffer);
+      };
+
       setIsListening(true);
 
       elapsedTimerRef.current = setInterval(() => {
         setElapsedSeconds((seconds) => seconds + 1);
       }, 1000);
-
-      const readLevel = (timestamp: number) => {
-        if (isPausedRef.current) {
-          animationFrameRef.current = requestAnimationFrame(readLevel);
-          return;
-        }
-
-        analyser.getFloatTimeDomainData(waveform);
-        let squareSum = 0;
-        for (const point of waveform) squareSum += point * point;
-
-        const rms = Math.sqrt(squareSum / waveform.length);
-        const dbfs = rms > 0 ? 20 * Math.log10(rms) : -60;
-        const nextValue = clamp(Math.round(((dbfs + 60) / 60) * 100), 0, 100);
-
-        if (nextValue >= 72) {
-          const now = Date.now();
-          if (!highEmotionRef.current && now - lastReminderAtRef.current >= 10_000) {
-            const reminderAudio = reminderAudioRef.current;
-            if (reminderAudio) {
-              reminderAudio.currentTime = 0;
-              void reminderAudio.play().catch(() => undefined);
-            }
-            lastReminderAtRef.current = now;
-          }
-          highEmotionRef.current = true;
-        } else if (nextValue < 64) {
-          highEmotionRef.current = false;
-        }
-
-        if (timestamp - lastVisualUpdateRef.current >= 120) {
-          setEmotionValue(nextValue);
-          lastVisualUpdateRef.current = timestamp;
-        }
-        if (timestamp - lastSampleRef.current >= 500) {
-          setSamples((current) => [
-            ...current.slice(-(MAX_SAMPLES - 1)),
-            { value: nextValue, recordedAt: Date.now() },
-          ]);
-          lastSampleRef.current = timestamp;
-        }
-
-        animationFrameRef.current = requestAnimationFrame(readLevel);
-      };
-
-      animationFrameRef.current = requestAnimationFrame(readLevel);
     } catch (cause) {
       const permissionDenied =
         cause instanceof DOMException &&
         (cause.name === "NotAllowedError" || cause.name === "PermissionDeniedError");
+      const serviceUnavailable =
+        cause instanceof Error && cause.message.startsWith("emotion-service-");
       setError(
         permissionDenied
           ? "没有获得麦克风权限。请在浏览器设置中允许后重试。"
+          : serviceUnavailable
+            ? "无法连接情绪识别服务，请确认 FastAPI 服务可用后重试。"
           : "暂时无法使用麦克风，请检查设备后重试。",
       );
       stopListening();
@@ -539,10 +680,13 @@ export function EmotionMonitor() {
       return;
     }
 
-    await audioContext.suspend();
-    reminderAudioRef.current?.pause();
     isPausedRef.current = true;
     setIsPaused(true);
+    if (websocketRef.current?.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({ type: "reset" }));
+    }
+    await audioContext.suspend();
+    reminderAudioRef.current?.pause();
     if (elapsedTimerRef.current !== null) {
       clearInterval(elapsedTimerRef.current);
       elapsedTimerRef.current = null;
