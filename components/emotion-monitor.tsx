@@ -17,6 +17,7 @@ type Sample = { value: number; recordedAt: number };
 type MoodLevel = { label: string; hint: string; color: string; softColor: string };
 
 const MAX_SAMPLES = 90;
+const COLLAPSED_SAMPLE_LIMIT = 22;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -91,32 +92,29 @@ function EmotionChart({
   };
 
   if (!expanded) {
-    const recentSamples = samples.slice(-32);
+    const isOverflowing = samples.length > COLLAPSED_SAMPLE_LIMIT;
+    const recentSamples = samples.slice(-COLLAPSED_SAMPLE_LIMIT);
     const streamKey = recentSamples.at(-1)?.recordedAt ?? "empty";
 
     return (
       <div className="relative h-14 w-full overflow-hidden px-1" aria-label="最近情绪值">
         <div
-          key={streamKey}
-          className="flex h-full w-full animate-[emotion-stream_500ms_linear] items-end justify-end gap-1.5"
+          key={isOverflowing ? streamKey : "growing"}
+          className={cn(
+            "flex h-full w-full items-end justify-start gap-1.5",
+            isOverflowing && "animate-[emotion-stream_500ms_linear]",
+          )}
         >
-          {recentSamples.length === 0
-            ? Array.from({ length: 24 }, (_, index) => (
-                <span
-                  key={index}
-                  className="h-3 w-1.5 shrink-0 rounded-full bg-neutral-200/70"
-                />
-              ))
-            : recentSamples.map((sample) => (
-                <span
-                  key={sample.recordedAt}
-                  className="w-1.5 shrink-0 rounded-full opacity-80"
-                  style={{
-                    height: `${Math.max(sample.value, 8)}%`,
-                    backgroundColor: getMoodLevel(sample.value).color,
-                  }}
-                />
-              ))}
+          {recentSamples.map((sample) => (
+            <span
+              key={sample.recordedAt}
+              className="w-1.5 shrink-0 rounded-full opacity-80"
+              style={{
+                height: `${Math.max(sample.value, 8)}%`,
+                backgroundColor: getMoodLevel(sample.value).color,
+              }}
+            />
+          ))}
         </div>
       </div>
     );
