@@ -50,17 +50,35 @@ export function ConversationTranscript({
   immersive?: boolean;
 }) {
   const focusedEntryIndex = useMemo(
-    () => findFocusedEntryIndex(entries, targetSeconds),
-    [entries, targetSeconds],
+    () => immersive
+      ? entries.length - 1
+      : findFocusedEntryIndex(entries, targetSeconds),
+    [entries, immersive, targetSeconds],
   );
   const focusedEntryRef = useRef<HTMLElement | null>(null);
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
+  const isFollowingLatestRef = useRef(true);
+
+  useEffect(() => {
+    if (immersive) isFollowingLatestRef.current = true;
+  }, [immersive]);
 
   useEffect(() => {
     const list = transcriptListRef.current;
-    const focusedEntry = focusedEntryRef.current;
-    if (!list || !focusedEntry) return;
+    if (!list) return;
 
+    if (immersive) {
+      if (isFollowingLatestRef.current) {
+        list.scrollTo({
+          top: list.scrollHeight,
+          behavior: entries.length > 1 ? "smooth" : "auto",
+        });
+      }
+      return;
+    }
+
+    const focusedEntry = focusedEntryRef.current;
+    if (!focusedEntry) return;
     const listRect = list.getBoundingClientRect();
     const entryRect = focusedEntry.getBoundingClientRect();
     if (entryRect.top < listRect.top) {
@@ -68,10 +86,16 @@ export function ConversationTranscript({
     } else if (entryRect.bottom > listRect.bottom) {
       list.scrollTo({ top: list.scrollTop + entryRect.bottom - listRect.bottom, behavior: "smooth" });
     }
-  }, [focusedEntryIndex, entries.length]);
+  }, [focusedEntryIndex, entries.length, immersive]);
+
+  const syncLatestFollowState = (list: HTMLDivElement) => {
+    if (!immersive) return;
+    const distanceFromBottom = list.scrollHeight - list.clientHeight - list.scrollTop;
+    isFollowingLatestRef.current = distanceFromBottom <= 4;
+  };
 
   return (
-    <section className="mx-auto mt-9 w-full max-w-[23rem] border-t border-neutral-200/80 pt-7 text-left">
+    <section className="mx-auto mt-3 w-full max-w-[23rem] text-left">
       <div className="flex items-end justify-between gap-5 px-1">
         <div>
           <h2 className="text-[17px] font-semibold tracking-[-0.025em]">对话记录</h2>
@@ -83,7 +107,7 @@ export function ConversationTranscript({
       </div>
 
       {entries.length === 0 ? (
-        <div className="px-1 py-10 text-center">
+        <div className="mt-5 border-t border-neutral-200/80 px-1 py-10 text-center">
           <p className="text-sm leading-6 text-neutral-400">
             {isPaused
               ? "转写已暂停，继续记录后恢复。"
@@ -96,10 +120,26 @@ export function ConversationTranscript({
         <div
           ref={transcriptListRef}
           data-transcript-list
+          aria-live="polite"
           className={cn(
-            "mt-4 overflow-y-auto overscroll-contain px-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+            "mt-5 overflow-y-auto overscroll-contain border-t border-neutral-200/80 px-1 pt-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
             immersive ? "max-h-[calc(100dvh-18rem)] min-h-48" : "max-h-[17rem]",
           )}
+          onWheel={(event) => {
+            if (!immersive) return;
+            const list = event.currentTarget;
+            const distanceFromBottom = list.scrollHeight - list.clientHeight - list.scrollTop;
+            isFollowingLatestRef.current = distanceFromBottom <= 4 && event.deltaY > 0;
+          }}
+          onPointerDown={() => {
+            if (immersive) isFollowingLatestRef.current = false;
+          }}
+          onPointerUp={(event) => syncLatestFollowState(event.currentTarget)}
+          onTouchStart={() => {
+            if (immersive) isFollowingLatestRef.current = false;
+          }}
+          onTouchEnd={(event) => syncLatestFollowState(event.currentTarget)}
+          onScroll={(event) => syncLatestFollowState(event.currentTarget)}
         >
           {entries.map((entry, index) => {
             const isFocused = index === focusedEntryIndex;
