@@ -8,7 +8,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { MicOff, Pause, Play } from "lucide-react";
+import { MicOff, Pause, Play, Settings2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -369,10 +369,15 @@ export function EmotionMonitor() {
           <p className="text-[17px] font-semibold tracking-[-0.025em]">缓一缓</p>
           <p className="mt-0.5 text-[11px] font-medium tracking-[0.08em] text-neutral-400">HUAN YI HUAN</p>
         </div>
-        <div className="flex items-center gap-2 rounded-full bg-white/75 px-3 py-2 text-xs font-medium text-neutral-500 shadow-sm ring-1 ring-black/[0.04] backdrop-blur-xl">
-          <span className={cn("size-1.5 rounded-full", isListening && !isPaused ? "animate-pulse bg-emerald-500" : isPaused ? "bg-amber-400" : "bg-neutral-300")} />
-          {isListening ? isPaused ? "已暂停" : "正在倾听" : "等待开始"}
-        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="rounded-full bg-white/75 px-3 text-neutral-500 shadow-sm backdrop-blur-xl"
+        >
+          <Settings2 data-icon="inline-start" />
+          设置
+        </Button>
       </header>
 
       <section
