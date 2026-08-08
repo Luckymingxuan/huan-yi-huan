@@ -2017,46 +2017,259 @@ var STANDARD_PARAMETER_DESCRIPTORS = [
 	}
 ];
 //#endregion
-//#region src/processor.ts
-var PROCESSOR_NAME = "soundtouch-processor";
+//#region src/lpc.ts
 /**
-* Audio render-thread processor that applies SoundTouch transformations to stereo blocks.
+* Computes the biased autocorrelation of `frame` for lags 0..`order`.
 *
 * @remarks
-* Receives audio from the main thread, applies pitch, tempo, and rate transformations,
-* and outputs processed stereo audio. Handles runtime strategy switching via messages.
+* A symmetric Hamming window is applied before computing the autocorrelation
+* to reduce spectral leakage at frame boundaries. The result is a length-`(order+1)`
+* array where index `k` corresponds to lag `k`.
+*
+* @param frame - Input signal frame.
+* @param order - LPC predictor order; returned array has length `order + 1`.
+* @returns Autocorrelation coefficients `r[0..order]`.
 */
-var SoundTouchProcessor = class extends SoundTouchProcessorBase {
-	/** Static AudioParam metadata consumed by the browser. */
-	static get parameterDescriptors() {
-		return STANDARD_PARAMETER_DESCRIPTORS;
+function autocorrelate(frame, order) {
+	const N = frame.length;
+	const windowed = new Float32Array(N);
+	for (let i = 0; i < N; i++) windowed[i] = frame[i] * (.54 - .46 * Math.cos(2 * Math.PI * i / (N - 1)));
+	const r = new Float32Array(order + 1);
+	for (let k = 0; k <= order; k++) {
+		let sum = 0;
+		for (let n = 0; n < N - k; n++) sum += windowed[n] * windowed[n + k];
+		r[k] = sum;
 	}
+	return r;
+}
+/**
+* Computes LPC predictor coefficients from an autocorrelation vector using
+* the Levinson-Durbin recursion.
+*
+* @remarks
+* Returns the predictor coefficients `a[0..order-1]` (0-based index corresponds
+* to predictor lag 1..`order`) such that the predictor is:
+* ```
+* x̂[n] = a[0]*x[n-1] + a[1]*x[n-2] + ... + a[order-1]*x[n-order]
+* ```
+* Returns a zero vector if the signal is silent (`r[0] < 1e-10`).
+*
+* @param r - Autocorrelation array from {@link autocorrelate} (length `order + 1`).
+* @param order - Number of predictor coefficients to compute.
+* @returns LPC predictor coefficients `a[0..order-1]`.
+*/
+function levinsonDurbin(r, order) {
+	const a = new Float32Array(order);
+	if (r[0] < 1e-10) return a;
+	const aPrev = new Float32Array(order);
+	let E = r[0];
+	for (let m = 1; m <= order; m++) {
+		let num = r[m];
+		for (let j = 0; j < m - 1; j++) num -= a[j] * r[m - 1 - j];
+		/* v8 ignore next */
+		if (Math.abs(E) < 1e-15) break;
+		const k = Math.max(-.9999, Math.min(.9999, num / E));
+		for (let j = 0; j < m - 1; j++) aPrev[j] = a[j];
+		for (let j = 0; j < m - 1; j++) a[j] = aPrev[j] - k * aPrev[m - 2 - j];
+		a[m - 1] = k;
+		E *= 1 - k * k;
+		if (E < 1e-15) break;
+	}
+	return a;
+}
+/**
+* Applies the LPC analysis (whitening) FIR filter to a signal frame in-place.
+*
+* @remarks
+* Computes the prediction residual:
+* ```
+* e[n] = x[n] − a[0]·x[n−1] − a[1]·x[n−2] − … − a[p−1]·x[n−p]
+* ```
+* The filter state `zi` (length `order`) holds the `order` most recent input
+* samples (`zi[0]` = x[n−1], `zi[1]` = x[n−2], …) and is updated in-place
+* so the state carries over across successive calls.
+*
+* @param frame - Input signal samples.
+* @param a - LPC predictor coefficients from {@link levinsonDurbin}.
+* @param zi - Filter memory (modified in-place). Allocate as `new Float32Array(order)`.
+* @returns New array containing the whitened residual signal.
+*/
+function applyAnalysisFilter(frame, a, zi) {
+	const order = a.length;
+	const out = new Float32Array(frame.length);
+	for (let n = 0; n < frame.length; n++) {
+		let e = frame[n];
+		for (let k = 0; k < order; k++) e -= a[k] * zi[k];
+		out[n] = e;
+		for (let k = order - 1; k > 0; k--) zi[k] = zi[k - 1];
+		zi[0] = frame[n];
+	}
+	return out;
+}
+/**
+* Applies the LPC synthesis (coloring) IIR filter to a residual frame.
+*
+* @remarks
+* Reconstructs a colored signal from the residual:
+* ```
+* y[n] = e[n] + a[0]·y[n−1] + a[1]·y[n−2] + … + a[p−1]·y[n−p]
+* ```
+* The filter state `zi` (length `order`) holds the `order` most recent output
+* samples (`zi[0]` = y[n−1], `zi[1]` = y[n−2], …) and is updated in-place.
+*
+* Combined with {@link applyAnalysisFilter} using the same coefficients,
+* this reconstructs the original signal: `synthesis(analysis(x)) ≈ x`.
+*
+* @param frame - Residual signal (output of the analysis filter).
+* @param a - LPC predictor coefficients from {@link levinsonDurbin}.
+* @param zi - Filter memory (modified in-place). Allocate as `new Float32Array(order)`.
+* @returns New array containing the re-colored output signal.
+*/
+function applySynthesisFilter(frame, a, zi) {
+	const order = a.length;
+	const out = new Float32Array(frame.length);
+	for (let n = 0; n < frame.length; n++) {
+		let y = frame[n];
+		for (let k = 0; k < order; k++) y += a[k] * zi[k];
+		if (!Number.isFinite(y)) {
+			zi.fill(0);
+			y = 0;
+		}
+		out[n] = y;
+		for (let k = order - 1; k > 0; k--) zi[k] = zi[k - 1];
+		zi[0] = y;
+	}
+	return out;
+}
+//#endregion
+//#region src/formant-correction-processor.ts
+var PROCESSOR_NAME = "formant-correction-processor";
+/**
+* Audio render-thread processor that applies SoundTouch pitch-shifting with
+* LPC-based formant preservation.
+*
+* @remarks
+* For each render block the processor:
+* 1. Feeds original input to the SoundTouch pipeline to produce pitch-shifted output.
+* 2. Computes LPC coefficients from a 512-sample sliding window of the input signal.
+* 3. Applies the LPC analysis filter to the pitch-shifted output (removes shifted formants).
+* 4. Applies the LPC synthesis filter with the original input coefficients (restores original formants).
+* 5. Blends the corrected signal with the raw pitch-shifted signal using `formantStrength`.
+*
+* When `formantStrength = 0` the output is identical to `SoundTouchNode`.
+* When `formantStrength = 1` formants are fully locked to the original pitch.
+*/
+var FormantCorrectionProcessor = class extends SoundTouchProcessorBase {
+	static get parameterDescriptors() {
+		return [...STANDARD_PARAMETER_DESCRIPTORS, {
+			name: "formantStrength",
+			defaultValue: 1,
+			minValue: 0,
+			maxValue: 1,
+			automationRate: "k-rate"
+		}];
+	}
+	_inputHistL;
+	_inputHistR;
+	_histPos;
+	_lpcL;
+	_lpcR;
+	_analysisZiL;
+	_analysisZiR;
+	_synthesisZiL;
+	_synthesisZiR;
 	/**
-	* @param options Worklet constructor options provided by the main thread.
-	*
-	* @remarks
-	* Unknown interpolation strategy ids are logged and coerced to `lanczos`
-	* so render-thread startup remains resilient.
+	* @param options Worklet constructor options from the main thread.
 	*/
 	constructor(options) {
-		super("[SoundTouchProcessor]", {
+		super("[FormantCorrectionProcessor]", {
 			sampleRate,
 			sampleBufferType: options?.processorOptions?.sampleBufferType ?? "circular",
-			interpolationStrategy: SoundTouchProcessorBase.resolveStrategy(options?.processorOptions?.interpolationStrategy, "[SoundTouchProcessor]")
+			interpolationStrategy: SoundTouchProcessorBase.resolveStrategy(options?.processorOptions?.interpolationStrategy, "[FormantCorrectionProcessor]")
 		});
+		this._inputHistL = new Float32Array(512);
+		this._inputHistR = new Float32Array(512);
+		this._histPos = 0;
+		this._lpcL = new Float32Array(16);
+		this._lpcR = new Float32Array(16);
+		this._analysisZiL = new Float32Array(16);
+		this._analysisZiR = new Float32Array(16);
+		this._synthesisZiL = new Float32Array(16);
+		this._synthesisZiR = new Float32Array(16);
+	}
+	/**
+	* Updates the LPC circular input buffer and recomputes coefficients for both channels.
+	*/
+	updateLpc(leftInput, rightInput, frameCount) {
+		for (let i = 0; i < frameCount; i++) {
+			this._inputHistL[this._histPos] = leftInput[i];
+			this._inputHistR[this._histPos] = rightInput[i];
+			this._histPos = (this._histPos + 1) % 512;
+		}
+		const winL = new Float32Array(512);
+		const winR = new Float32Array(512);
+		for (let i = 0; i < 512; i++) {
+			const idx = (this._histPos + i) % 512;
+			winL[i] = this._inputHistL[idx];
+			winR[i] = this._inputHistR[idx];
+		}
+		this._lpcL = levinsonDurbin(autocorrelate(winL, 16), 16);
+		this._lpcR = levinsonDurbin(autocorrelate(winR, 16), 16);
+	}
+	beforePipeProcess(leftInput, rightInput, frameCount, parameters) {
+		if ((parameters["formantStrength"][0] ?? 0) > 0) this.updateLpc(leftInput, rightInput, frameCount);
+	}
+	extractSamples(leftOutput, rightOutput, frameCount, toExtract, parameters) {
+		const formantStrength = parameters["formantStrength"][0] ?? 0;
+		if (toExtract > 0) {
+			const extracted = this._outputSamples;
+			this._pipe.outputBuffer.extract(extracted, 0, toExtract);
+			this._pipe.outputBuffer.receive(toExtract);
+			if (formantStrength > 0) {
+				const rawL = new Float32Array(toExtract);
+				const rawR = new Float32Array(toExtract);
+				for (let i = 0; i < toExtract; i++) {
+					rawL[i] = extracted[i * 2];
+					rawR[i] = extracted[i * 2 + 1];
+				}
+				const residualL = applyAnalysisFilter(rawL, this._lpcL, this._analysisZiL);
+				const residualR = applyAnalysisFilter(rawR, this._lpcR, this._analysisZiR);
+				const corrL = applySynthesisFilter(residualL, this._lpcL, this._synthesisZiL);
+				const corrR = applySynthesisFilter(residualR, this._lpcR, this._synthesisZiR);
+				const s = formantStrength;
+				const si = 1 - s;
+				for (let i = 0; i < toExtract; i++) {
+					const l = si * rawL[i] + s * corrL[i];
+					const r = si * rawR[i] + s * corrR[i];
+					leftOutput[i] = Number.isFinite(l) ? l : 0;
+					rightOutput[i] = Number.isFinite(r) ? r : 0;
+				}
+			} else for (let i = 0; i < toExtract; i++) {
+				const l = extracted[i * 2];
+				const r = extracted[i * 2 + 1];
+				leftOutput[i] = Number.isFinite(l) ? l : 0;
+				rightOutput[i] = Number.isFinite(r) ? r : 0;
+			}
+		}
+		for (let i = toExtract; i < frameCount; i++) {
+			leftOutput[i] = 0;
+			rightOutput[i] = 0;
+		}
+		return {
+			outputRms: 0,
+			outputPeak: 0
+		};
 	}
 	onProcessComplete(result) {
 		if (this._blockCount % 100 === 0) this.port.postMessage({
 			type: "metrics",
 			framesBuffered: result.available,
 			underrunCount: this._underrunCount,
-			blockCount: this._blockCount,
-			outputRms: result.outputRms,
-			outputPeak: result.outputPeak
+			blockCount: this._blockCount
 		});
 	}
 };
-registerProcessor(PROCESSOR_NAME, SoundTouchProcessor);
+registerProcessor(PROCESSOR_NAME, FormantCorrectionProcessor);
 //#endregion
 
-//# sourceMappingURL=soundtouch-processor.js.map
+//# sourceMappingURL=formant-correction-processor.js.map

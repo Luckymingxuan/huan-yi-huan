@@ -43,11 +43,12 @@ type EmotionMessage = {
   probs?: number[];
 };
 type RollingPcmBuffer = {
-  samples: Int16Array;
+  samples: Float32Array;
   sampleRate: number;
   writeIndex: number;
   length: number;
 };
+type ReplayProcessorModule = typeof import("@soundtouchjs/formant-correction-worklet");
 
 const DEFAULT_COLLAPSED_SAMPLE_LIMIT = 22;
 const COLLAPSED_BAR_STEP = 12;
@@ -56,13 +57,19 @@ const TARGET_SAMPLE_RATE = 16_000;
 const RECENT_AUDIO_SECONDS = 10;
 const REPLAY_CAPTURE_TAIL_MS = 5_000;
 const REPLAY_FEEDBACK_GUARD_MS = 250;
-const SOUNDTOUCH_PROCESSOR_URL = "/audio/soundtouch-processor.js";
+const SOUNDTOUCH_PROCESSOR_URL = "/audio/formant-correction-processor.js";
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
 const FASTAPI_HOST = process.env.NEXT_PUBLIC_FASTAPI_HOST?.trim() || "127.0.0.1";
 const FASTAPI_PORT = process.env.NEXT_PUBLIC_FASTAPI_PORT?.trim() || "8000";
+let replayProcessorModulePromise: Promise<ReplayProcessorModule> | null = null;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function loadReplayProcessor() {
+  replayProcessorModulePromise ??= import("@soundtouchjs/formant-correction-worklet");
+  return replayProcessorModulePromise;
 }
 
 function getEmotionWebSocketUrl() {
@@ -103,24 +110,16 @@ function resampleToPcm16(input: Float32Array, sourceSampleRate: number) {
   return output;
 }
 
-function float32ToPcm16(input: Float32Array) {
-  const output = new Int16Array(input.length);
-  for (let index = 0; index < input.length; index += 1) {
-    output[index] = Math.round(clamp(input[index], -1, 1) * 32767);
-  }
-  return output;
-}
-
 function createRollingPcmBuffer(sampleRate = TARGET_SAMPLE_RATE): RollingPcmBuffer {
   return {
-    samples: new Int16Array(sampleRate * RECENT_AUDIO_SECONDS),
+    samples: new Float32Array(sampleRate * RECENT_AUDIO_SECONDS),
     sampleRate,
     writeIndex: 0,
     length: 0,
   };
 }
 
-function appendRollingPcm(buffer: RollingPcmBuffer, chunk: Int16Array) {
+function appendRollingPcm(buffer: RollingPcmBuffer, chunk: Float32Array) {
   const capacity = buffer.samples.length;
   if (chunk.length >= capacity) {
     buffer.samples.set(chunk.subarray(chunk.length - capacity));
@@ -141,7 +140,7 @@ function appendRollingPcm(buffer: RollingPcmBuffer, chunk: Int16Array) {
 }
 
 function snapshotRollingPcm(buffer: RollingPcmBuffer) {
-  const snapshot = new Int16Array(buffer.length);
+  const snapshot = new Float32Array(buffer.length);
   if (buffer.length === 0) return snapshot;
 
   const capacity = buffer.samples.length;
@@ -160,13 +159,32 @@ function clearRollingPcm(buffer: RollingPcmBuffer) {
   buffer.length = 0;
 }
 
-function getReplayGain(pcm: Int16Array) {
+function getReplayGain(pcm: Float32Array) {
   let peak = 0;
   for (let index = 0; index < pcm.length; index += 1) {
     peak = Math.max(peak, Math.abs(pcm[index]));
   }
   if (peak === 0) return 1;
-  return Math.min(4, (0.9 * 32767) / peak);
+  return Math.min(4, 0.9 / peak);
+}
+
+function preventAudioBufferClipping(audioBuffer: AudioBuffer) {
+  let peak = 0;
+  for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+    const channelData = audioBuffer.getChannelData(channel);
+    for (let index = 0; index < channelData.length; index += 1) {
+      peak = Math.max(peak, Math.abs(channelData[index]));
+    }
+  }
+  if (peak <= 0.98) return;
+
+  const scale = 0.9 / peak;
+  for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+    const channelData = audioBuffer.getChannelData(channel);
+    for (let index = 0; index < channelData.length; index += 1) {
+      channelData[index] *= scale;
+    }
+  }
 }
 
 function getMoodLevel(value: number): MoodLevel {
@@ -696,7 +714,7 @@ export function EmotionMonitor() {
     const channelData = audioBuffer.getChannelData(0);
     const replayGain = getReplayGain(pcm);
     for (let index = 0; index < pcm.length; index += 1) {
-      channelData[index] = clamp((pcm[index] / 32768) * replayGain, -1, 1);
+      channelData[index] = clamp(pcm[index] * replayGain, -1, 1);
     }
 
     const pitchSemitones = getReplayPitchSemitones(replayEffectRef.current);
@@ -711,17 +729,26 @@ export function EmotionMonitor() {
     let replayBuffer = audioBuffer;
     if (pitchSemitones !== 0) {
       try {
-        const { processOffline } = await import("@soundtouchjs/audio-worklet");
+        const { processOffline } = await loadReplayProcessor();
         replayBuffer = await processOffline({
           input: audioBuffer,
           processorUrl: SOUNDTOUCH_PROCESSOR_URL,
           pitchSemitones,
           playbackRate: 1,
+          formantStrength: 0.7,
+          interpolationStrategy: "lanczos",
+          stretchParameters: {
+            sequenceMs: 40,
+            seekWindowMs: 15,
+            overlapMs: 8,
+            quickSeek: false,
+          },
         });
       } catch {
-        setError("变声音效处理失败，已使用原声。请通过 localhost 或 HTTPS 打开页面。");
+        setError("高质量变声音效处理失败，已使用原声。请通过 localhost 或 HTTPS 打开页面。");
       }
     }
+    preventAudioBufferClipping(replayBuffer);
 
     if (
       replayRequestIdRef.current !== requestId ||
@@ -763,6 +790,12 @@ export function EmotionMonitor() {
       return false;
     }
 
+    if (replayEffectRef.current !== "original") {
+      void loadReplayProcessor().catch(() => {
+        replayProcessorModulePromise = null;
+      });
+      void fetch(SOUNDTOUCH_PROCESSOR_URL, { cache: "force-cache" }).catch(() => undefined);
+    }
     setIsReplayPending(true);
     replayStartTimerRef.current = window.setTimeout(() => {
       replayStartTimerRef.current = null;
@@ -971,7 +1004,7 @@ export function EmotionMonitor() {
 
         const input = event.inputBuffer.getChannelData(0);
         if (reminderOptionRef.current === RECENT_AUDIO_REPLAY_ID) {
-          appendRollingPcm(rollingAudioRef.current, float32ToPcm16(input));
+          appendRollingPcm(rollingAudioRef.current, input);
         }
         const pcm = resampleToPcm16(input, audioContext.sampleRate);
         if (

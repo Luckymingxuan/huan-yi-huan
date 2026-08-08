@@ -11,7 +11,7 @@ importers:
       '@base-ui/react':
         specifier: ^1.7.0
         version: 1.7.0(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
-      '@soundtouchjs/audio-worklet':
+      '@soundtouchjs/formant-correction-worklet':
         specifier: 2.1.0
         version: 2.1.0
       class-variance-authority:
@@ -616,11 +616,11 @@ packages:
     resolution: {integrity: sha512-tlqY9xq5ukxTUZBmoOp+m61cqwQD5pHJtFY3Mn8CA8ps6yghLH/Hw8UPdqg4OLmFW3IFlcXnQNmo/dh8HzXYIQ==}
     engines: {node: '>=18'}
 
-  '@soundtouchjs/audio-worklet@2.1.0':
-    resolution: {integrity: sha512-+LKvyvUx4ErwdD6jiUTHYqm5K7LMr+wGPz9PJufOORdDHL283RL2EsPHmdrtsCaDyapZIX2Xf7NljQVnx9lDwQ==}
-
   '@soundtouchjs/core@2.1.0':
     resolution: {integrity: sha512-LXZ1HPXnyu0iPw+qlxcb48zuIQfP+DZAyRGG2w2/nfdKsJVft3122J6wHO/uVhZwUOjrgjYPrwu6DBkd66KMtA==}
+
+  '@soundtouchjs/formant-correction-worklet@2.1.0':
+    resolution: {integrity: sha512-9noBQBrKB2aaklwYZmUeux9xYMv8eH61cFVn/IrnZLYBaEhdfCmay7gBHfEDRT1hCZLmPpJJB4+BNzZhSRxyLQ==}
 
   '@soundtouchjs/interpolation-strategy-lanczos@2.1.0':
     resolution: {integrity: sha512-Nf/JO03CEVoMcLCo2tQdXg7zC5PkEtcudgonYRjmkFWASj7bc/EX48Qy70L9kt1bfol54x1Fg/xU2os32b6Z2g==}
@@ -3500,15 +3500,14 @@ snapshots:
 
   '@sindresorhus/merge-streams@4.0.0': {}
 
-  '@soundtouchjs/audio-worklet@2.1.0':
-    dependencies:
-      '@soundtouchjs/core': 2.1.0
-      '@soundtouchjs/interpolation-strategy-lanczos': 2.1.0
-      '@soundtouchjs/worklet-base': 2.1.0
-
   '@soundtouchjs/core@2.1.0':
     dependencies:
       '@soundtouchjs/interpolation-strategy-lanczos': 2.1.0
+
+  '@soundtouchjs/formant-correction-worklet@2.1.0':
+    dependencies:
+      '@soundtouchjs/core': 2.1.0
+      '@soundtouchjs/worklet-base': 2.1.0
 
   '@soundtouchjs/interpolation-strategy-lanczos@2.1.0': {}
 
