@@ -75,21 +75,20 @@ function EmotionChart({
   onSelect: (index: number | null) => void;
 }) {
   const chartRef = useRef<HTMLDivElement>(null);
+  const isFollowingLatestRef = useRef(true);
 
-  const selectFromPointer = useCallback(
-    (clientX: number) => {
-      if (!chartRef.current || samples.length === 0) return;
-      const bounds = chartRef.current.getBoundingClientRect();
-      const ratio = clamp((clientX - bounds.left) / bounds.width, 0, 0.999);
-      onSelect(Math.floor(ratio * samples.length));
-    },
-    [onSelect, samples.length],
-  );
-
-  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!expanded || (event.pointerType !== "touch" && event.buttons !== 1)) return;
-    selectFromPointer(event.clientX);
-  };
+  useEffect(() => {
+    if (!expanded || !chartRef.current || !isFollowingLatestRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      const chart = chartRef.current;
+      if (!chart) return;
+      chart.scrollTo({
+        left: chart.scrollWidth,
+        behavior: samples.length > 24 ? "smooth" : "auto",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [expanded, samples.length]);
 
   if (!expanded) {
     const isOverflowing = samples.length > COLLAPSED_SAMPLE_LIMIT;
@@ -123,23 +122,24 @@ function EmotionChart({
   return (
     <div
       ref={chartRef}
-      className="relative flex h-52 w-full touch-pan-y items-end gap-[3px] overflow-hidden px-1"
+      className="relative h-52 w-full touch-pan-x overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       aria-label="情绪值历史图表"
-      onPointerDown={(event) => selectFromPointer(event.clientX)}
-      onPointerMove={handlePointerMove}
+      onScroll={(event) => {
+        const chart = event.currentTarget;
+        const distanceFromEnd = chart.scrollWidth - chart.clientWidth - chart.scrollLeft;
+        isFollowingLatestRef.current = distanceFromEnd < 24;
+      }}
     >
-      {samples.length === 0 ? (
-        <div className="flex h-full w-full items-end gap-1.5" aria-hidden="true">
-          {Array.from({ length: 16 }, (_, index) => (
+      <div className="flex h-full w-max min-w-full items-end gap-1.5 px-1">
+        {samples.length === 0 ? (
+          Array.from({ length: 16 }, (_, index) => (
             <span
               key={index}
-              className="w-full rounded-full bg-neutral-200/70"
+              className="w-2 shrink-0 rounded-full bg-neutral-200/70"
               style={{ height: `${18 + ((index * 13) % 28)}%` }}
             />
-          ))}
-        </div>
-      ) : (
-        samples.map((sample, index) => {
+          ))
+        ) : samples.map((sample, index) => {
           const mood = getMoodLevel(sample.value);
           const isSelected = index === selectedIndex;
 
@@ -147,9 +147,12 @@ function EmotionChart({
             <button
               key={`${sample.recordedAt}-${index}`}
               type="button"
-              className="group relative flex h-full min-w-0 flex-1 items-end justify-center focus-visible:outline-none"
+              className="group relative flex h-full w-2 shrink-0 items-end justify-center focus-visible:outline-none"
               aria-label={`${formatClock(sample.recordedAt)}，情绪值 ${sample.value}`}
-              onClick={() => onSelect(index)}
+              onClick={() => {
+                isFollowingLatestRef.current = index === samples.length - 1;
+                onSelect(index);
+              }}
             >
               {isSelected && (
                 <span
@@ -169,8 +172,8 @@ function EmotionChart({
               />
             </button>
           );
-        })
-      )}
+        })}
+      </div>
     </div>
   );
 }
