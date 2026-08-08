@@ -2,9 +2,17 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
-import { ArrowLeft, Check, Pause, Play } from "lucide-react";
+import { ArrowLeft, Check, Pause, Play, RotateCcw } from "lucide-react";
 
 import { Button, buttonVariants } from "@/components/ui/button";
+import {
+  ALARM_SENSITIVITY_CHANGE_EVENT,
+  ALARM_SENSITIVITY_STORAGE_KEY,
+  DEFAULT_ALARM_SENSITIVITY,
+  MAX_ALARM_SENSITIVITY,
+  MIN_ALARM_SENSITIVITY,
+  normalizeAlarmSensitivity,
+} from "@/lib/alarm-sensitivity";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_REMINDER_OPTION_ID,
@@ -36,6 +44,23 @@ function getStoredReminderOption(): ReminderOptionId {
   }
 }
 
+function subscribeToAlarmSensitivity(onStoreChange: () => void) {
+  window.addEventListener("storage", onStoreChange);
+  window.addEventListener(ALARM_SENSITIVITY_CHANGE_EVENT, onStoreChange);
+  return () => {
+    window.removeEventListener("storage", onStoreChange);
+    window.removeEventListener(ALARM_SENSITIVITY_CHANGE_EVENT, onStoreChange);
+  };
+}
+
+function getStoredAlarmSensitivity() {
+  try {
+    return normalizeAlarmSensitivity(window.localStorage.getItem(ALARM_SENSITIVITY_STORAGE_KEY));
+  } catch {
+    return DEFAULT_ALARM_SENSITIVITY;
+  }
+}
+
 export function AudioSettings() {
   const [playingId, setPlayingId] = useState<ReminderAudioId | null>(null);
   const previewRef = useRef<HTMLAudioElement | null>(null);
@@ -43,6 +68,11 @@ export function AudioSettings() {
     subscribeToReminderAudio,
     getStoredReminderOption,
     () => DEFAULT_REMINDER_OPTION_ID,
+  );
+  const alarmSensitivity = useSyncExternalStore(
+    subscribeToAlarmSensitivity,
+    getStoredAlarmSensitivity,
+    () => DEFAULT_ALARM_SENSITIVITY,
   );
 
   useEffect(() => {
@@ -58,6 +88,11 @@ export function AudioSettings() {
     setPlayingId(null);
     window.localStorage.setItem(REMINDER_AUDIO_STORAGE_KEY, id);
     window.dispatchEvent(new Event(REMINDER_AUDIO_CHANGE_EVENT));
+  };
+
+  const changeAlarmSensitivity = (value: number) => {
+    window.localStorage.setItem(ALARM_SENSITIVITY_STORAGE_KEY, String(value));
+    window.dispatchEvent(new Event(ALARM_SENSITIVITY_CHANGE_EVENT));
   };
 
   const togglePreview = async (id: ReminderAudioId) => {
@@ -87,23 +122,21 @@ export function AudioSettings() {
 
   return (
     <main className="mx-auto min-h-[100dvh] w-full max-w-[480px] bg-[#f7f7f5] px-5 pb-[max(2rem,env(safe-area-inset-bottom))] pt-[max(1.25rem,env(safe-area-inset-top))] text-neutral-950 shadow-[0_0_80px_rgba(0,0,0,0.08)]">
-      <header className="flex items-center justify-between">
+      <header className="h-10">
         <Link
           href="/"
           aria-label="返回情绪检测"
           className={buttonVariants({
             variant: "outline",
             size: "icon-lg",
-            className: "size-10 rounded-full bg-white/80 shadow-sm",
+            className: "fixed left-[max(1.25rem,calc((100vw-480px)/2+1.25rem))] top-[max(1.25rem,env(safe-area-inset-top))] z-50 size-10 rounded-full bg-white/90 shadow-sm backdrop-blur-sm",
           })}
         >
           <ArrowLeft />
         </Link>
-        <p className="text-sm font-medium text-neutral-500">提醒设置</p>
-        <div className="size-10" aria-hidden="true" />
       </header>
 
-      <section className="mt-16">
+      <section className="mt-4">
         <p className="text-xs font-medium tracking-[0.12em] text-neutral-400">REMINDER</p>
         <h1 className="mt-3 text-3xl font-semibold tracking-[-0.045em]">选择提醒方式</h1>
         <p className="mt-3 max-w-sm text-sm leading-6 text-neutral-500">
@@ -192,6 +225,54 @@ export function AudioSettings() {
             </article>
           );
         })}
+      </section>
+
+      <section className="mt-10" aria-labelledby="alarm-sensitivity-title">
+        <div className="flex items-end justify-between gap-4">
+          <div>
+            <p className="text-xs font-medium tracking-[0.12em] text-neutral-400">SENSITIVITY</p>
+            <h2 id="alarm-sensitivity-title" className="mt-2 text-xl font-semibold tracking-tight">
+              报警灵敏度
+            </h2>
+          </div>
+          <div className="flex items-center gap-2">
+            <output className="text-2xl font-semibold tabular-nums" htmlFor="alarm-sensitivity">
+              {alarmSensitivity}%
+            </output>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="rounded-full"
+              disabled={alarmSensitivity === DEFAULT_ALARM_SENSITIVITY}
+              onClick={() => changeAlarmSensitivity(DEFAULT_ALARM_SENSITIVITY)}
+            >
+              <RotateCcw />
+              复位
+            </Button>
+          </div>
+        </div>
+
+        <div className="mt-5 rounded-[1.75rem] bg-white px-5 py-6 shadow-sm ring-1 ring-black/[0.04]">
+          <input
+            id="alarm-sensitivity"
+            type="range"
+            min={MIN_ALARM_SENSITIVITY}
+            max={MAX_ALARM_SENSITIVITY}
+            step={5}
+            value={alarmSensitivity}
+            aria-label="报警灵敏度"
+            onChange={(event) => changeAlarmSensitivity(Number(event.target.value))}
+            className="h-2 w-full cursor-pointer appearance-none rounded-full bg-neutral-200 accent-neutral-950"
+          />
+          <div className="mt-3 flex justify-between text-xs text-neutral-400">
+            <span>10% · 较低</span>
+            <span>100% · 很高</span>
+          </div>
+          <p className="mt-4 text-xs leading-5 text-neutral-500">
+            默认 50%，与当前报警效果一致。数值越高，越容易触发提醒。
+          </p>
+        </div>
       </section>
 
       <p className="mt-8 text-center text-xs leading-5 text-neutral-400">

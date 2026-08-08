@@ -13,6 +13,12 @@ import { MicOff, Pause, Play, Settings2 } from "lucide-react";
 
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
+  ALARM_SENSITIVITY_STORAGE_KEY,
+  DEFAULT_ALARM_SENSITIVITY,
+  getAlarmThresholds,
+  normalizeAlarmSensitivity,
+} from "@/lib/alarm-sensitivity";
+import {
   getReminderAudio,
   getReminderOptionId,
   RECENT_AUDIO_REPLAY_ID,
@@ -44,8 +50,6 @@ const RECENT_AUDIO_SECONDS = 10;
 const REPLAY_CAPTURE_TAIL_MS = 5_000;
 const REPLAY_FEEDBACK_GUARD_MS = 250;
 const MAX_WEBSOCKET_BUFFER = 512 * 1024;
-const ALARM_TRIGGER_VALUE = 45;
-const ALARM_REARM_VALUE = 39;
 const FASTAPI_HOST = process.env.NEXT_PUBLIC_FASTAPI_HOST?.trim() || "127.0.0.1";
 const FASTAPI_PORT = process.env.NEXT_PUBLIC_FASTAPI_PORT?.trim() || "8000";
 
@@ -589,6 +593,7 @@ export function EmotionMonitor() {
   const isReplayingRef = useRef(false);
   const highEmotionRef = useRef(false);
   const lastReminderAtRef = useRef(0);
+  const alarmThresholdsRef = useRef(getAlarmThresholds(DEFAULT_ALARM_SENSITIVITY));
 
   const mood = getMoodLevel(emotionValue);
   const selectedSample = useMemo(() => {
@@ -735,7 +740,8 @@ export function EmotionMonitor() {
     const nextValue = getNegativeEmotionValue(probs, emotionLabelsRef.current);
     if (nextValue === null) return;
 
-    if (nextValue >= ALARM_TRIGGER_VALUE) {
+    const { trigger, rearm } = alarmThresholdsRef.current;
+    if (nextValue >= trigger) {
       const now = Date.now();
       if (!highEmotionRef.current && now - lastReminderAtRef.current >= 10_000) {
         let reminderStarted = false;
@@ -754,7 +760,7 @@ export function EmotionMonitor() {
         }
       }
       highEmotionRef.current = true;
-    } else if (nextValue < ALARM_REARM_VALUE) {
+    } else if (nextValue < rearm) {
       highEmotionRef.current = false;
     }
 
@@ -784,6 +790,15 @@ export function EmotionMonitor() {
       }
       const reminderOption = getReminderOptionId(savedReminderId);
       reminderOptionRef.current = reminderOption;
+      let savedAlarmSensitivity: string | null = null;
+      try {
+        savedAlarmSensitivity = window.localStorage.getItem(ALARM_SENSITIVITY_STORAGE_KEY);
+      } catch {
+        // Storage can be unavailable in restrictive browser modes; use the default.
+      }
+      alarmThresholdsRef.current = getAlarmThresholds(
+        normalizeAlarmSensitivity(savedAlarmSensitivity),
+      );
       clearRollingPcm(rollingAudioRef.current);
       if (reminderOption !== RECENT_AUDIO_REPLAY_ID) {
         const reminder = getReminderAudio(reminderOption);
